@@ -28,9 +28,7 @@ def build_health(settings: Settings) -> dict[str, Any]:
                 "protocol": "smtp",
                 "from_addr": settings.email_from or None,
                 "allowlist_count": len(settings.outbound_allowlist),
-                "imap_configured": bool(
-                    settings.email_imap_host and settings.email_imap_user
-                ),
+                "imap_configured": settings.imap_configured,
             },
             "model": {
                 "configured": settings.model_configured,

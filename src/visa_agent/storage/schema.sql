@@ -71,3 +71,118 @@ ALTER TABLE outbox_messages
         'pending', 'blocked', 'processing', 'provider_accepted',
         'failed', 'status_unknown'
     ));
+
+-- S1.3 case persistence + workbench support
+CREATE TABLE IF NOT EXISTS cases (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    case_version INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL,
+    route TEXT,
+    resume_status TEXT,
+    customer_email TEXT,
+    title TEXT NOT NULL DEFAULT '',
+    waiting_customer BOOLEAN NOT NULL DEFAULT FALSE,
+    waiting_third_party BOOLEAN NOT NULL DEFAULT FALSE,
+    human_takeover BOOLEAN NOT NULL DEFAULT FALSE,
+    system_blocked BOOLEAN NOT NULL DEFAULT FALSE,
+    paused BOOLEAN NOT NULL DEFAULT FALSE,
+    cancelled BOOLEAN NOT NULL DEFAULT FALSE,
+    current_delivery_id TEXT,
+    closure_seq INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE cases ADD COLUMN IF NOT EXISTS closure_seq INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_cases_tenant_updated
+    ON cases (tenant_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS case_customer_confirmations (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    case_id TEXT NOT NULL REFERENCES cases(id),
+    case_version INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (tenant_id, case_id, case_version)
+);
+
+CREATE TABLE IF NOT EXISTS case_final_reviews (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    case_id TEXT NOT NULL REFERENCES cases(id),
+    case_version INTEGER NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('approve', 'reject')),
+    note TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (tenant_id, case_id, case_version)
+);
+
+CREATE TABLE IF NOT EXISTS case_reopen_grants (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    case_id TEXT NOT NULL REFERENCES cases(id),
+    authorized BOOLEAN NOT NULL DEFAULT TRUE,
+    note TEXT NOT NULL DEFAULT '',
+    bound_from_status TEXT,
+    bound_case_version INTEGER,
+    consumed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE case_reopen_grants ADD COLUMN IF NOT EXISTS bound_from_status TEXT;
+ALTER TABLE case_reopen_grants ADD COLUMN IF NOT EXISTS bound_case_version INTEGER;
+ALTER TABLE case_reopen_grants ADD COLUMN IF NOT EXISTS bound_closure_seq INTEGER;
+ALTER TABLE case_reopen_grants ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ;
+
+CREATE UNIQUE INDEX IF NOT EXISTS case_reopen_grants_one_active_per_closure
+    ON case_reopen_grants (tenant_id, case_id, bound_closure_seq)
+    WHERE consumed_at IS NULL AND authorized = TRUE;
+
+CREATE TABLE IF NOT EXISTS case_deliveries (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    case_id TEXT NOT NULL REFERENCES cases(id),
+    case_version INTEGER NOT NULL,
+    sent_at TIMESTAMPTZ,
+    receipt_at TIMESTAMPTZ,
+    simulated_send BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE case_deliveries ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
+ALTER TABLE case_deliveries ADD COLUMN IF NOT EXISTS simulated_send BOOLEAN NOT NULL DEFAULT TRUE;
+
+CREATE INDEX IF NOT EXISTS idx_case_deliveries_case
+    ON case_deliveries (tenant_id, case_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS email_attribution_audit (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    email_event_id TEXT NOT NULL,
+    from_case_id TEXT,
+    to_case_id TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- S1.4 model draft audit (synthetic context only; no side effects)
+CREATE TABLE IF NOT EXISTS model_calls (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    case_id TEXT,
+    case_version INTEGER,
+    model TEXT NOT NULL,
+    prompt_digest TEXT NOT NULL,
+    request_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    response_text TEXT NOT NULL DEFAULT '',
+    draft_text TEXT NOT NULL DEFAULT '',
+    candidate_facts JSONB NOT NULL DEFAULT '[]'::jsonb,
+    suggested_actions JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_calls_case
+    ON model_calls (tenant_id, case_id, created_at DESC);

@@ -99,6 +99,14 @@ class Settings:
             and self.email_from
         )
 
+    @property
+    def imap_configured(self) -> bool:
+        return bool(
+            self.email_imap_host
+            and self.email_imap_user
+            and self.email_imap_password
+        )
+
 
 def get_settings(env_path: Path | None = None) -> Settings:
     path = env_path or DEFAULT_ENV_PATH

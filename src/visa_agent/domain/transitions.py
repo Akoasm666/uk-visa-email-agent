@@ -167,8 +167,15 @@ def _requirements_for(
         req.add("customer_confirmation")
         req.add("final_approval")
 
+    # Send / resend must still be authorized on the *current* case version.
+    if target == CaseStatus.SENT_AWAITING_ACK:
+        req.add("customer_confirmation")
+        req.add("final_approval")
+
     if target == CaseStatus.DELIVERED:
         req.add("delivery_receipt")
+        req.add("customer_confirmation")
+        req.add("final_approval")
 
     if (
         current == CaseStatus.CLOSED
@@ -343,9 +350,14 @@ def validate_transition(
         )
 
 
+def forward_candidates(current: CaseStatus) -> frozenset[CaseStatus]:
+    """Graph edges from ``current`` (precondition checks applied separately)."""
+    return _FORWARD.get(current, frozenset())
+
+
 def allowed_targets(
     current: CaseStatus,
     ctx: TransitionContext | None = None,
 ) -> frozenset[CaseStatus]:
-    candidates = _FORWARD.get(current, frozenset()) | {current}
+    candidates = forward_candidates(current) | {current}
     return frozenset(s for s in candidates if can_transition(current, s, ctx))

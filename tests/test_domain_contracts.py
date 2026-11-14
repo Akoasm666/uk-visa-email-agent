@@ -316,6 +316,8 @@ class TransitionPreconditionTests(unittest.TestCase):
                 CaseStatus.DELIVERED,
                 TransitionContext(
                     case_version=1,
+                    customer_confirmation_case_version=1,
+                    final_review_approval_case_version=1,
                     delivery_id="del-9",
                     receipt_for_delivery_id=None,
                 ),
@@ -331,6 +333,8 @@ class TransitionPreconditionTests(unittest.TestCase):
                 CaseStatus.DELIVERED,
                 TransitionContext(
                     case_version=1,
+                    customer_confirmation_case_version=1,
+                    final_review_approval_case_version=1,
                     delivery_id="del-new",
                     receipt_for_delivery_id="del-old",
                 ),
@@ -339,12 +343,26 @@ class TransitionPreconditionTests(unittest.TestCase):
             ctx.exception.code, ErrorCode.DELIVERY_RECEIPT_REQUIRED
         )
 
+    def test_rejects_sent_without_current_approval(self) -> None:
+        with self.assertRaises(DomainError) as ctx:
+            validate_transition(
+                CaseStatus.READY_TO_DELIVER,
+                CaseStatus.SENT_AWAITING_ACK,
+                TransitionContext(
+                    case_version=2,
+                    customer_confirmation_case_version=2,
+                ),
+            )
+        self.assertEqual(ctx.exception.code, ErrorCode.REVIEW_APPROVAL_REQUIRED)
+
     def test_allows_delivered_with_matching_receipt(self) -> None:
         validate_transition(
             CaseStatus.SENT_AWAITING_ACK,
             CaseStatus.DELIVERED,
             TransitionContext(
                 case_version=1,
+                customer_confirmation_case_version=1,
+                final_review_approval_case_version=1,
                 delivery_id="del-9",
                 receipt_for_delivery_id="del-9",
             ),
