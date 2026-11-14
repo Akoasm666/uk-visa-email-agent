@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: visa-agent-pg
+    environment:
+      POSTGRES_DB: visa_agent
+      POSTGRES_USER: visa_agent
+      POSTGRES_PASSWORD: visa_agent_dev
+    ports:
+      - "15432:5432"
+    volumes:
+      - visa_agent_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U visa_agent -d visa_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  visa_agent_pg_data:
