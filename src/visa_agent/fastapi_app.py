@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+import base64
+
 from visa_agent.ai_capabilities import generate_case_draft, list_case_drafts
 from visa_agent.case_service import (
     attribute_inbound_to_case,
@@ -25,6 +27,13 @@ from visa_agent.case_service.service import bump_case_version
 from visa_agent.config import get_settings
 from visa_agent.domain.enums import CaseStatus, ErrorCode
 from visa_agent.domain.errors import DomainError
+from visa_agent.document_pipeline import (
+    attach_evidence,
+    list_annotations,
+    list_evidence,
+    record_annotation,
+    set_evidence_quarantine,
+)
 from visa_agent.email_adapter import (
     InboundEmail,
     OutboxRequest,
@@ -42,7 +51,7 @@ boot = get_settings()
 boot.file_storage_dir.mkdir(parents=True, exist_ok=True)
 apply_migrations(boot.database_url)
 
-app = FastAPI(title="visa-email-agent", version="0.4.0")
+app = FastAPI(title="visa-email-agent", version="0.5.0")
 
 
 class InboundBody(BaseModel):
@@ -101,6 +110,30 @@ class AttributeBody(BaseModel):
 
 class PollBody(BaseModel):
     limit: int = 10
+
+
+class EvidenceAttachBody(BaseModel):
+    """Base64 payload keeps workbench/API free of multipart requirements."""
+
+    filename: str
+    content_base64: str
+    expected_case_version: int
+    content_type: str = "application/octet-stream"
+    classification: str = "unclassified"
+    source_email_event_id: str | None = None
+
+
+class EvidenceQuarantineBody(BaseModel):
+    quarantine_status: str
+    expected_case_version: int
+    rejection_reason: str = ""
+
+
+class EvidenceAnnotationBody(BaseModel):
+    field_key: str
+    field_value: str
+    expected_case_version: int
+    note: str = ""
 
 
 def _domain_http(exc: DomainError) -> HTTPException:
@@ -172,7 +205,7 @@ def root() -> dict[str, Any]:
         "success": True,
         "data": {
             "service": "visa-email-agent",
-            "stage": "S1.4",
+            "stage": "S2.1",
             "workbench": "/workbench",
             "docs": "/health",
         },
@@ -422,6 +455,142 @@ def _draft_payload(draft: Any) -> dict[str, Any]:
     }
 
 
+def _evidence_payload(ev: Any) -> dict[str, Any]:
+    return {
+        "evidence_id": ev.id,
+        "case_id": ev.case_id,
+        "case_version": ev.case_version,
+        "file_id": ev.file_id,
+        "content_sha256": ev.content_sha256,
+        "original_filename": ev.original_filename,
+        "content_type": ev.content_type,
+        "byte_size": ev.byte_size,
+        "classification": ev.classification,
+        "quarantine_status": ev.quarantine_status,
+        "rejection_reason": ev.rejection_reason,
+        "source_email_event_id": ev.source_email_event_id,
+    }
+
+
+@app.post("/cases/{case_id}/evidence")
+def api_attach_evidence(case_id: str, body: EvidenceAttachBody) -> dict[str, Any]:
+    settings = get_settings()
+    try:
+        raw = base64.b64decode(body.content_base64, validate=True)
+    except Exception as exc:  # noqa: BLE001
+        raise _domain_http(
+            DomainError(
+                code=ErrorCode.VALIDATION_ERROR,
+                message="content_base64 is invalid",
+                details=(str(exc),),
+            )
+        ) from exc
+    try:
+        evidence = attach_evidence(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            file_store=LocalFileStore(settings.file_storage_dir),
+            data=raw,
+            original_filename=body.filename,
+            content_type=body.content_type,
+            classification=body.classification,
+            source_email_event_id=body.source_email_event_id,
+            expected_case_version=body.expected_case_version,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {"success": True, "data": _evidence_payload(evidence)}
+
+
+@app.get("/cases/{case_id}/evidence")
+def api_list_evidence(case_id: str) -> dict[str, Any]:
+    settings = get_settings()
+    items = list_evidence(
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+        case_id=case_id,
+    )
+    return {"success": True, "data": [_evidence_payload(e) for e in items]}
+
+
+@app.post("/cases/{case_id}/evidence/{evidence_id}/quarantine")
+def api_quarantine(
+    case_id: str, evidence_id: str, body: EvidenceQuarantineBody
+) -> dict[str, Any]:
+    settings = get_settings()
+    try:
+        evidence = set_evidence_quarantine(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            evidence_id=evidence_id,
+            quarantine_status=body.quarantine_status,
+            rejection_reason=body.rejection_reason,
+            expected_case_version=body.expected_case_version,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {"success": True, "data": _evidence_payload(evidence)}
+
+
+@app.post("/cases/{case_id}/evidence/{evidence_id}/annotations")
+def api_annotate(
+    case_id: str, evidence_id: str, body: EvidenceAnnotationBody
+) -> dict[str, Any]:
+    settings = get_settings()
+    try:
+        ann = record_annotation(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            evidence_id=evidence_id,
+            field_key=body.field_key,
+            field_value=body.field_value,
+            note=body.note,
+            expected_case_version=body.expected_case_version,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {
+        "success": True,
+        "data": {
+            "annotation_id": ann.id,
+            "evidence_id": ann.evidence_id,
+            "case_id": ann.case_id,
+            "case_version": ann.case_version,
+            "field_key": ann.field_key,
+            "field_value": ann.field_value,
+            "note": ann.note,
+        },
+    }
+
+
+@app.get("/cases/{case_id}/evidence/{evidence_id}/annotations")
+def api_list_annotations(case_id: str, evidence_id: str) -> dict[str, Any]:
+    settings = get_settings()
+    items = list_annotations(
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+        case_id=case_id,
+        evidence_id=evidence_id,
+    )
+    return {
+        "success": True,
+        "data": [
+            {
+                "annotation_id": a.id,
+                "evidence_id": a.evidence_id,
+                "case_version": a.case_version,
+                "field_key": a.field_key,
+                "field_value": a.field_value,
+                "note": a.note,
+            }
+            for a in items
+        ],
+    }
+
+
 @app.post("/cases/{case_id}/draft")
 def api_generate_draft(case_id: str) -> dict[str, Any]:
     """Generate a model draft from synthetic context. No send / approve / status change."""
@@ -550,6 +719,11 @@ def workbench_detail(case_id: str, request: Request) -> HTMLResponse:
         case_id=case_id,
         limit=5,
     )
+    evidence_items = list_evidence(
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+        case_id=case_id,
+    )
     msg = request.query_params.get("msg")
     return HTMLResponse(
         render_detail(
@@ -557,6 +731,7 @@ def workbench_detail(case_id: str, request: Request) -> HTMLResponse:
             allowed=allowed,
             message=msg,
             drafts=drafts,
+            evidence_items=evidence_items,
         )
     )
 
@@ -670,6 +845,61 @@ async def workbench_draft(case_id: str) -> RedirectResponse:
     try:
         draft = generate_case_draft(settings=settings, case_id=case_id)
         msg = f"draft ready ({draft.model_call_id[:8]})"
+    except DomainError as exc:
+        msg = str(exc)
+    return _wb_redirect(case_id, msg)
+
+
+@app.post("/workbench/cases/{case_id}/evidence")
+async def workbench_attach_evidence(
+    case_id: str, request: Request
+) -> RedirectResponse:
+    form = await _form(request)
+    settings = get_settings()
+    try:
+        text = form.get("content_text") or ""
+        evidence = attach_evidence(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            file_store=LocalFileStore(settings.file_storage_dir),
+            data=text.encode("utf-8"),
+            original_filename=form.get("filename") or "untitled.txt",
+            content_type="text/plain; charset=utf-8",
+            classification=form.get("classification") or "unclassified",
+            expected_case_version=_parse_expected_version(
+                form.get("expected_case_version")
+            ),
+        )
+        msg = (
+            f"evidence isolated ({evidence.id[:8]}) "
+            f"status={evidence.quarantine_status} @ v{evidence.case_version}"
+        )
+    except DomainError as exc:
+        msg = str(exc)
+    return _wb_redirect(case_id, msg)
+
+
+@app.post("/workbench/cases/{case_id}/evidence/{evidence_id}/annotations")
+async def workbench_annotate(
+    case_id: str, evidence_id: str, request: Request
+) -> RedirectResponse:
+    form = await _form(request)
+    settings = get_settings()
+    try:
+        ann = record_annotation(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            evidence_id=evidence_id,
+            field_key=form.get("field_key") or "",
+            field_value=form.get("field_value") or "",
+            note=form.get("note") or "",
+            expected_case_version=_parse_expected_version(
+                form.get("expected_case_version")
+            ),
+        )
+        msg = f"annotated {ann.field_key} @ v{ann.case_version}"
     except DomainError as exc:
         msg = str(exc)
     return _wb_redirect(case_id, msg)

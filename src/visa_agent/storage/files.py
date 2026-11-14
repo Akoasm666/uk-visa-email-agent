@@ -20,6 +20,42 @@ class LocalFileStore:
         path.write_bytes(data)
         return file_id, digest, path
 
+    @staticmethod
+    def file_id_for(digest: str, *, suffix: str) -> str:
+        """Path-unique id: content digest + extension (not digest alone)."""
+        return f"{digest}{suffix}"
+
+    def content_path(self, digest: str, *, suffix: str = "") -> Path:
+        return self.root / self.file_id_for(digest, suffix=suffix)
+
+    def path_for_file_id(self, file_id: str) -> Path:
+        return self.root / file_id
+
+    def put_bytes_content_addressed(
+        self, data: bytes, *, suffix: str = ""
+    ) -> tuple[str, str, Path, bool]:
+        """Store by content hash + suffix so path identity is exact.
+
+        Returns ``(file_id, digest, path, created_new)``.
+        ``file_id`` equals the on-disk filename (digest + suffix).
+        """
+        digest = hashlib.sha256(data).hexdigest()
+        file_id = self.file_id_for(digest, suffix=suffix)
+        path = self.path_for_file_id(file_id)
+        created_new = False
+        if not path.exists():
+            tmp = self.root / f".tmp-{uuid.uuid4().hex}{suffix}"
+            tmp.write_bytes(data)
+            tmp.replace(path)
+            created_new = True
+        return file_id, digest, path, created_new
+
+    def delete_file(self, path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def put_bytes_deterministic(
         self,
         key: str,

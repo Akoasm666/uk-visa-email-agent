@@ -186,3 +186,43 @@ CREATE TABLE IF NOT EXISTS model_calls (
 
 CREATE INDEX IF NOT EXISTS idx_model_calls_case
     ON model_calls (tenant_id, case_id, created_at DESC);
+
+-- S2.1 document pipeline: isolated originals + human annotations (no OCR confirm)
+CREATE TABLE IF NOT EXISTS case_evidence (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    case_id TEXT NOT NULL REFERENCES cases(id),
+    case_version INTEGER NOT NULL,
+    file_id TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    original_filename TEXT NOT NULL DEFAULT '',
+    content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+    byte_size INTEGER NOT NULL DEFAULT 0,
+    classification TEXT NOT NULL DEFAULT 'unclassified',
+    quarantine_status TEXT NOT NULL DEFAULT 'isolated'
+        CHECK (quarantine_status IN ('isolated', 'rejected', 'accepted_for_review')),
+    rejection_reason TEXT NOT NULL DEFAULT '',
+    source_email_event_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_case_evidence_case
+    ON case_evidence (tenant_id, case_id, created_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS case_evidence_sha_per_case
+    ON case_evidence (tenant_id, case_id, content_sha256);
+
+CREATE TABLE IF NOT EXISTS evidence_annotations (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    evidence_id TEXT NOT NULL REFERENCES case_evidence(id),
+    case_id TEXT NOT NULL REFERENCES cases(id),
+    case_version INTEGER NOT NULL,
+    field_key TEXT NOT NULL,
+    field_value TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_evidence_annotations_evidence
+    ON evidence_annotations (tenant_id, evidence_id, created_at DESC);

@@ -483,6 +483,42 @@ def consume_reopen_grant(
         )
 
 
+def bump_case_version_in_conn(
+    *,
+    conn: psycopg.Connection,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+    expected_case_version: int | None = None,
+    required: bool = False,
+) -> CaseRecord:
+    """Bump case_version inside an existing transaction (caller holds conn)."""
+    case = get_case(
+        database_url=database_url,
+        tenant_id=tenant_id,
+        case_id=case_id,
+        conn=conn,
+        for_update=True,
+    )
+    _require_version(case, expected_case_version, required=required)
+    conn.execute(
+        """
+        UPDATE cases
+        SET case_version = case_version + 1,
+            current_delivery_id = NULL,
+            updated_at = NOW()
+        WHERE tenant_id = %s AND id = %s AND case_version = %s
+        """,
+        (tenant_id, case_id, case.case_version),
+    )
+    return get_case(
+        database_url=database_url,
+        tenant_id=tenant_id,
+        case_id=case_id,
+        conn=conn,
+    )
+
+
 def bump_case_version(
     *,
     database_url: str,
@@ -493,24 +529,12 @@ def bump_case_version(
     """Invalidate prior confirmations/approvals by advancing case_version."""
     with psycopg.connect(database_url) as conn:
         with conn.transaction():
-            case = get_case(
+            bump_case_version_in_conn(
+                conn=conn,
                 database_url=database_url,
                 tenant_id=tenant_id,
                 case_id=case_id,
-                conn=conn,
-                for_update=True,
-            )
-            _require_version(case, expected_case_version)
-            # Stale delivery must not satisfy delivered after a version bump.
-            conn.execute(
-                """
-                UPDATE cases
-                SET case_version = case_version + 1,
-                    current_delivery_id = NULL,
-                    updated_at = NOW()
-                WHERE tenant_id = %s AND id = %s AND case_version = %s
-                """,
-                (tenant_id, case_id, case.case_version),
+                expected_case_version=expected_case_version,
             )
     return get_case(database_url=database_url, tenant_id=tenant_id, case_id=case_id)
 
@@ -646,6 +670,25 @@ def attribute_inbound_to_case(
                 raise DomainError(
                     code=ErrorCode.VALIDATION_ERROR,
                     message="reason required for re-attribution",
+                )
+            # Evidence still pointing at this email would leave the old case
+            # able to deliver under stale approvals — block until cleared.
+            linked = conn.execute(
+                """
+                SELECT id, case_id FROM case_evidence
+                WHERE tenant_id = %s AND source_email_event_id = %s
+                ORDER BY created_at
+                """,
+                (tenant_id, email_event_id),
+            ).fetchall()
+            if linked:
+                raise DomainError(
+                    code=ErrorCode.VALIDATION_ERROR,
+                    message=(
+                        "email has linked evidence; handle those materials "
+                        "and their approvals before re-attribution"
+                    ),
+                    details=tuple(f"{row[1]}:{row[0]}" for row in linked),
                 )
             conn.execute(
                 """

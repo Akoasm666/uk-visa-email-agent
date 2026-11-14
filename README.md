@@ -5,16 +5,17 @@
 
 ## 当前阶段
 
-**S1.4 已通过**（模型草稿 + 白名单真实往返）。下一阶段：**S2 文档与规则底座**（W03 文档管线 / W05 规则容器 / 审核台增强）。
+**S2.1 已通过**（文档管线）。下一阶段：**S2.2 规则容器（W05 最小）**。
 
 | 交付物 | 路径 |
 |---|---|
 | 冻结契约 | `docs/` + `src/visa_agent/domain/` |
+| 文档管线 | `src/visa_agent/document_pipeline/` → `/cases/{id}/evidence` |
 | 模型草稿 | `src/visa_agent/ai_capabilities/` → `POST /cases/{id}/draft` |
-| 收件验收 | **人工确认**白名单邮箱是否收到；可选 `POST /internal/email/poll`（若已配 IMAP） |
+| 收件 | 人工确认白名单邮箱；可选 `POST /internal/email/poll` |
 | 案件服务 | `src/visa_agent/case_service/` |
 | 工作流迁移 | `src/visa_agent/workflow/` |
-| 工作台 | `GET /workbench`（含「生成草稿」） |
+| 工作台 | `GET /workbench` |
 | HTTP | FastAPI：`visa_agent.fastapi_app` |
 | Postgres | `docker-compose.yml` → 宿主 `15432` |
 | 本地文件 | `data/files/` |

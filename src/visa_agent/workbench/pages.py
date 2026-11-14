@@ -88,12 +88,64 @@ def _render_draft_block(
     )
 
 
+def _render_evidence_section(
+    case: CaseRecord, evidence_items: list[object]
+) -> str:
+    if not evidence_items:
+        body = "<p>（尚无证据原件）</p>"
+    else:
+        rows = []
+        for ev in evidence_items:
+            eid = escape(getattr(ev, "id", "") or "")
+            name = escape(getattr(ev, "original_filename", "") or "")
+            status = escape(getattr(ev, "quarantine_status", "") or "")
+            reason = escape(getattr(ev, "rejection_reason", "") or "")
+            sha = escape((getattr(ev, "content_sha256", "") or "")[:12])
+            rows.append(
+                "<tr>"
+                f"<td><code>{eid[:8]}…</code></td>"
+                f"<td>{name}</td>"
+                f"<td>{status}</td>"
+                f"<td><code>{sha}</code></td>"
+                f"<td>{reason or '—'}</td>"
+                "</tr>"
+                f"<tr><td colspan='5'>"
+                f"<form method='post' action='/workbench/cases/{escape(case.id)}"
+                f"/evidence/{eid}/annotations' style='margin:.35rem 0'>"
+                f"{_version_field(case)}"
+                f"<input name='field_key' placeholder='字段' required>"
+                f"<input name='field_value' placeholder='人工标注值' required>"
+                f"<button type='submit'>标注（升版）</button>"
+                f"</form></td></tr>"
+            )
+        body = (
+            "<table><thead><tr>"
+            "<th>ID</th><th>文件</th><th>隔离</th><th>sha</th><th>原因</th>"
+            "</tr></thead><tbody>"
+            + "".join(rows)
+            + "</tbody></table>"
+        )
+    return f"""<section>
+<strong>证据原件（隔离存储 · 不改字节 · 无 OCR 自动确认）</strong>
+{body}
+<form method="post" action="/workbench/cases/{escape(case.id)}/evidence"
+      style="margin-top:.75rem">
+  {_version_field(case)}
+  <input name="filename" placeholder="文件名.pdf" required>
+  <input name="content_text" placeholder="合成演示正文（将按原文落盘）" required>
+  <input name="classification" placeholder="分类（可选）" value="unclassified">
+  <button type="submit">上传隔离原件</button>
+</form>
+</section>"""
+
+
 def render_detail(
     case: CaseRecord,
     *,
     allowed: list[CaseStatus],
     message: str | None = None,
     drafts: list[object] | None = None,
+    evidence_items: list[object] | None = None,
 ) -> str:
     opts = "\n".join(
         f'<option value="{escape(s.value)}">{escape(s.value)}</option>'
@@ -163,6 +215,7 @@ button,input,select{{font:inherit;padding:.35rem .6rem}}
   <button type="submit">生成草稿</button>
 </form>
 </section>
+{_render_evidence_section(case, evidence_items or [])}
 <section>
 <strong>状态迁移</strong>
 <form method="post" action="/workbench/cases/{escape(case.id)}/transition">
