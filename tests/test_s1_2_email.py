@@ -986,8 +986,9 @@ class OutboxGateIntegrationTests(unittest.TestCase):
 
 class OutboxHttpContractTests(unittest.TestCase):
     def test_rejects_case_fields_on_outbox_request(self) -> None:
-        from visa_agent.fastapi_app import app
+        from visa_agent.fastapi_app import app, bootstrap
 
+        bootstrap()
         client = TestClient(app)
         resp = client.post(
             "/internal/email/outbox",
@@ -1002,8 +1003,9 @@ class OutboxHttpContractTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 422)
 
     def test_rejects_approval_fields_on_outbox_request(self) -> None:
-        from visa_agent.fastapi_app import app
+        from visa_agent.fastapi_app import app, bootstrap
 
+        bootstrap()
         client = TestClient(app)
         resp = client.post(
             "/internal/email/outbox",
@@ -1018,8 +1020,9 @@ class OutboxHttpContractTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 422)
 
     def test_gate_rejection_returns_success_false(self) -> None:
-        from visa_agent.fastapi_app import app
+        from visa_agent.fastapi_app import app, bootstrap
 
+        bootstrap()
         client = TestClient(app)
         resp = client.post(
             "/internal/email/outbox",

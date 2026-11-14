@@ -33,6 +33,7 @@ _FILE_BACKED_KEYS = frozenset(
         "EMAIL_IMAP_USER",
         "EMAIL_IMAP_PASSWORD",
         "EMAIL_OUTBOUND_ALLOWLIST",
+        "RULE_PUBLISH_TOKEN",
     }
 )
 
@@ -85,6 +86,11 @@ class Settings:
     email_imap_user: str
     email_imap_password: str
     outbound_allowlist: frozenset[str]
+    rule_publish_token: str
+
+    @property
+    def rule_publish_enabled(self) -> bool:
+        return bool(self.rule_publish_token.strip())
 
     @property
     def model_configured(self) -> bool:
@@ -144,4 +150,6 @@ def get_settings(env_path: Path | None = None) -> Settings:
         outbound_allowlist=_split_allowlist(
             _value(file_vals, "EMAIL_OUTBOUND_ALLOWLIST", "")
         ),
+        # Empty by default — publish stays closed until an admin token is set.
+        rule_publish_token=_value(file_vals, "RULE_PUBLISH_TOKEN", ""),
     )

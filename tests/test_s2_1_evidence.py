@@ -721,8 +721,9 @@ class EvidencePipelineTests(unittest.TestCase):
             )
     def setUp(self) -> None:
         apply_migrations(DB)
-        from visa_agent.fastapi_app import app
+        from visa_agent.fastapi_app import app, bootstrap
 
+        bootstrap()
         self.client = TestClient(app)
 
     def test_api_attach_and_annotate(self) -> None:

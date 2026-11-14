@@ -468,8 +468,9 @@ class CaseWorkflowTests(unittest.TestCase):
 class CaseHttpTests(unittest.TestCase):
     def setUp(self) -> None:
         apply_migrations(DB)
-        from visa_agent.fastapi_app import app
+        from visa_agent.fastapi_app import app, bootstrap
 
+        bootstrap()
         self.client = TestClient(app)
 
     def test_api_confirm_requires_version_field(self) -> None:

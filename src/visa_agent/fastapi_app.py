@@ -1,4 +1,4 @@
-"""FastAPI entrypoint for S1."""
+"""FastAPI entrypoint for S2."""
 
 from __future__ import annotations
 
@@ -24,7 +24,9 @@ from visa_agent.case_service import (
     set_takeover,
 )
 from visa_agent.case_service.service import bump_case_version
-from visa_agent.config import get_settings
+import os
+
+from visa_agent.config import Settings, get_settings
 from visa_agent.domain.enums import CaseStatus, ErrorCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.document_pipeline import (
@@ -42,16 +44,36 @@ from visa_agent.email_adapter import (
     poll_imap_inbox,
 )
 from visa_agent.http_app import build_health
+from visa_agent.rules import (
+    ensure_seed_visitor_pack,
+    evaluate_case_requirements,
+    get_rule_pack,
+    impact_scan,
+    list_case_requirements,
+    list_rule_packs,
+    publish_rule_pack,
+    set_case_active_pack,
+)
 from visa_agent.storage.files import LocalFileStore
 from visa_agent.storage.migrate import apply_migrations
 from visa_agent.workbench.pages import render_detail, render_list
 from visa_agent.workflow.transitions import apply_transition, list_allowed_targets
 
-boot = get_settings()
-boot.file_storage_dir.mkdir(parents=True, exist_ok=True)
-apply_migrations(boot.database_url)
+app = FastAPI(title="visa-email-agent", version="0.6.0")
 
-app = FastAPI(title="visa-email-agent", version="0.5.0")
+
+def bootstrap(settings: Settings | None = None) -> Settings:
+    """Migrate + seed against the given settings (or current get_settings())."""
+    boot = settings or get_settings()
+    boot.file_storage_dir.mkdir(parents=True, exist_ok=True)
+    apply_migrations(boot.database_url)
+    ensure_seed_visitor_pack(database_url=boot.database_url)
+    return boot
+
+
+# Tests set VISA_AGENT_SKIP_APP_BOOT=1 before import, then call bootstrap(test_settings).
+if os.environ.get("VISA_AGENT_SKIP_APP_BOOT") != "1":
+    bootstrap()
 
 
 class InboundBody(BaseModel):
@@ -136,11 +158,18 @@ class EvidenceAnnotationBody(BaseModel):
     note: str = ""
 
 
+class BindPackBody(BaseModel):
+    pack_id: str
+    pack_version: int
+
+
 def _domain_http(exc: DomainError) -> HTTPException:
     if exc.code == ErrorCode.NOT_FOUND:
         status = 404
     elif exc.code == ErrorCode.CONFLICT_VERSION:
         status = 409
+    elif exc.code == ErrorCode.UNAUTHORIZED:
+        status = 403
     else:
         status = 400
     return HTTPException(
@@ -152,6 +181,40 @@ def _domain_http(exc: DomainError) -> HTTPException:
             "details": list(exc.details),
         },
     )
+
+
+def _pack_payload(pack: Any) -> dict[str, Any]:
+    return {
+        "pack_id": pack.pack_id,
+        "pack_version": pack.pack_version,
+        "route": pack.route,
+        "title": pack.title,
+        "source_url": pack.source_url,
+        "source_retrieved_on": pack.source_retrieved_on,
+        "published": pack.published,
+        "published_at": getattr(pack, "published_at", None),
+        "requirements": [
+            {
+                "key": r.key,
+                "title": r.title,
+                "description": r.description,
+                "severity": r.severity,
+            }
+            for r in pack.requirements
+        ],
+    }
+
+
+def _req_state_payload(st: Any) -> dict[str, Any]:
+    return {
+        "requirement_key": st.requirement_key,
+        "status": st.status,
+        "reason": st.reason,
+        "severity": st.severity,
+        "pack_id": st.pack_id,
+        "pack_version": st.pack_version,
+        "case_version": st.case_version,
+    }
 
 
 def _parse_expected_version(raw: str | None) -> int | None:
@@ -205,7 +268,7 @@ def root() -> dict[str, Any]:
         "success": True,
         "data": {
             "service": "visa-email-agent",
-            "stage": "S2.1",
+            "stage": "S2.2",
             "workbench": "/workbench",
             "docs": "/health",
         },
@@ -589,6 +652,129 @@ def api_list_annotations(case_id: str, evidence_id: str) -> dict[str, Any]:
             for a in items
         ],
     }
+
+
+@app.get("/rule-packs")
+def api_list_rule_packs() -> dict[str, Any]:
+    settings = get_settings()
+    packs = list_rule_packs(database_url=settings.database_url)
+    return {"success": True, "data": [_pack_payload(p) for p in packs]}
+
+
+@app.get("/rule-packs/{pack_id}/impact")
+def api_impact_scan(
+    pack_id: str,
+    from_version: int,
+    to_version: int | None = None,
+) -> dict[str, Any]:
+    """Registered before /{pack_version} so 'impact' is not parsed as an int."""
+    settings = get_settings()
+    try:
+        rows = impact_scan(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            pack_id=pack_id,
+            from_version=from_version,
+            to_version=to_version,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {"success": True, "data": rows}
+
+
+@app.get("/rule-packs/{pack_id}/{pack_version}")
+def api_get_rule_pack(pack_id: str, pack_version: int) -> dict[str, Any]:
+    settings = get_settings()
+    try:
+        pack = get_rule_pack(
+            database_url=settings.database_url,
+            pack_id=pack_id,
+            pack_version=pack_version,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {"success": True, "data": _pack_payload(pack)}
+
+
+@app.post("/rule-packs/{pack_id}/{pack_version}/publish")
+def api_publish_rule_pack(pack_id: str, pack_version: int, request: Request) -> dict[str, Any]:
+    """Publish requires server-configured RULE_PUBLISH_TOKEN (disabled when empty)."""
+    settings = get_settings()
+    provided = request.headers.get("X-Rule-Publish-Token", "")
+    auth = request.headers.get("Authorization", "")
+    if not provided and auth.lower().startswith("bearer "):
+        provided = auth[7:].strip()
+    try:
+        pack = publish_rule_pack(
+            database_url=settings.database_url,
+            pack_id=pack_id,
+            pack_version=pack_version,
+            provided_token=provided,
+            configured_token=settings.rule_publish_token,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {"success": True, "data": _pack_payload(pack)}
+
+
+@app.post("/cases/{case_id}/active-pack")
+def api_bind_active_pack(case_id: str, body: BindPackBody) -> dict[str, Any]:
+    settings = get_settings()
+    try:
+        case = set_case_active_pack(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            pack_id=body.pack_id,
+            pack_version=body.pack_version,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {
+        "success": True,
+        "data": {
+            "case_id": case_id,
+            "case_version": case.case_version,
+            "active_pack_id": body.pack_id,
+            "active_pack_version": body.pack_version,
+        },
+    }
+
+
+@app.post("/cases/{case_id}/requirements/evaluate")
+def api_evaluate_requirements(case_id: str) -> dict[str, Any]:
+    settings = get_settings()
+    try:
+        result = evaluate_case_requirements(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {
+        "success": True,
+        "data": {
+            "pack_id": result.pack_id,
+            "pack_version": result.pack_version,
+            "case_id": result.case_id,
+            "case_version": result.case_version,
+            "blocking_keys": list(result.blocking_keys),
+            "all_required_clear": result.all_required_clear,
+            "states": [_req_state_payload(s) for s in result.states],
+        },
+    }
+
+
+@app.get("/cases/{case_id}/requirements")
+def api_list_requirements(case_id: str) -> dict[str, Any]:
+    settings = get_settings()
+    items = list_case_requirements(
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+        case_id=case_id,
+    )
+    return {"success": True, "data": [_req_state_payload(s) for s in items]}
 
 
 @app.post("/cases/{case_id}/draft")

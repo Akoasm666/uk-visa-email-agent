@@ -202,8 +202,9 @@ class DraftUnitTests(unittest.TestCase):
 class DraftHttpTests(unittest.TestCase):
     def setUp(self) -> None:
         apply_migrations(DB)
-        from visa_agent.fastapi_app import app
+        from visa_agent.fastapi_app import app, bootstrap
 
+        bootstrap()
         self.client = TestClient(app)
 
     def test_api_draft_uses_injectable_path_via_patch(self) -> None:

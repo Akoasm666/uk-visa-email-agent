@@ -226,3 +226,51 @@ CREATE TABLE IF NOT EXISTS evidence_annotations (
 
 CREATE INDEX IF NOT EXISTS idx_evidence_annotations_evidence
     ON evidence_annotations (tenant_id, evidence_id, created_at DESC);
+
+-- S2.2 rules container (W05 minimal): versioned packs, human publish only
+CREATE TABLE IF NOT EXISTS rule_packs (
+    pack_id TEXT NOT NULL,
+    pack_version INTEGER NOT NULL CHECK (pack_version >= 1),
+    route TEXT NOT NULL,
+    title TEXT NOT NULL,
+    source_url TEXT NOT NULL DEFAULT '',
+    source_retrieved_on DATE,
+    published BOOLEAN NOT NULL DEFAULT FALSE,
+    published_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (pack_id, pack_version)
+);
+
+CREATE TABLE IF NOT EXISTS rule_requirements (
+    id TEXT PRIMARY KEY,
+    pack_id TEXT NOT NULL,
+    pack_version INTEGER NOT NULL,
+    requirement_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT 'required'
+        CHECK (severity IN ('required', 'advisory', 'transfer_human')),
+    UNIQUE (pack_id, pack_version, requirement_key),
+    FOREIGN KEY (pack_id, pack_version)
+        REFERENCES rule_packs (pack_id, pack_version)
+);
+
+CREATE TABLE IF NOT EXISTS case_requirement_states (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    case_id TEXT NOT NULL REFERENCES cases(id),
+    case_version INTEGER NOT NULL,
+    pack_id TEXT NOT NULL,
+    pack_version INTEGER NOT NULL,
+    requirement_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (tenant_id, case_id, pack_id, pack_version, requirement_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_case_requirement_states_case
+    ON case_requirement_states (tenant_id, case_id, updated_at DESC);
+
+ALTER TABLE cases ADD COLUMN IF NOT EXISTS active_pack_id TEXT;
+ALTER TABLE cases ADD COLUMN IF NOT EXISTS active_pack_version INTEGER;

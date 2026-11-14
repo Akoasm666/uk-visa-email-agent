@@ -37,10 +37,12 @@ class ConfigTests(unittest.TestCase):
                 email_imap_user="",
                 email_imap_password="",
                 outbound_allowlist=frozenset(),
+                rule_publish_token="",
             )
             self.assertEqual(settings.outbound_allowlist, frozenset())
             self.assertFalse(settings.email_configured)
             self.assertTrue(settings.model_configured)
+            self.assertFalse(settings.rule_publish_enabled)
 
     def test_loads_dotenv_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -89,6 +91,7 @@ class HealthPayloadTests(unittest.TestCase):
                 email_imap_user="",
                 email_imap_password="",
                 outbound_allowlist=frozenset(),
+                rule_publish_token="",
             )
             payload = build_health(settings)
             self.assertTrue(payload["success"])
