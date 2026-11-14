@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
-
 import psycopg
 
 from visa_agent.case_service.service import (
@@ -13,7 +11,7 @@ from visa_agent.case_service.service import (
     get_case,
     persist_case_status,
 )
-from visa_agent.domain.enums import CaseStatus, ErrorCode
+from visa_agent.domain.enums import CaseStatus, DeliveryKind, ErrorCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.domain.transitions import (
     TransitionContext,
@@ -24,12 +22,62 @@ from visa_agent.domain.transitions import (
 
 def _assert_send_authorized(ctx: TransitionContext) -> None:
     """Current-version confirmation + approval required before (re)send."""
-    # Use the shared requirement set for entering sent_awaiting_ack.
     validate_transition(
         CaseStatus.READY_TO_DELIVER,
         CaseStatus.SENT_AWAITING_ACK,
         ctx,
     )
+
+
+def _require_bound_final_delivery(
+    conn: psycopg.Connection,
+    *,
+    case: CaseRecord,
+) -> None:
+    """SENT/DELIVERED must bind the real final-package send — never invent one."""
+    if not case.current_delivery_id:
+        raise DomainError(
+            code=ErrorCode.DELIVERY_GATE_FAILED,
+            message=(
+                "final package must be sent (with outbox linkage) "
+                "before awaiting acknowledgement"
+            ),
+        )
+    row = conn.execute(
+        """
+        SELECT d.case_version, d.package_id, d.outbox_id, d.sent_at, p.package_kind
+        FROM case_deliveries d
+        LEFT JOIN delivery_packages p
+          ON p.id = d.package_id AND p.tenant_id = d.tenant_id
+        WHERE d.tenant_id = %s AND d.case_id = %s AND d.id = %s
+        """,
+        (case.tenant_id, case.id, case.current_delivery_id),
+    ).fetchone()
+    if row is None:
+        raise DomainError(
+            code=ErrorCode.DELIVERY_GATE_FAILED,
+            message="current delivery record missing",
+            details=(case.current_delivery_id,),
+        )
+    case_version, package_id, outbox_id, sent_at, package_kind = row
+    if int(case_version) != case.case_version:
+        raise DomainError(
+            code=ErrorCode.CONFLICT_VERSION,
+            message="current delivery is bound to a different case_version",
+            details=(str(case_version), str(case.case_version)),
+        )
+    if not package_id or not outbox_id or sent_at is None:
+        raise DomainError(
+            code=ErrorCode.DELIVERY_GATE_FAILED,
+            message="current delivery is not linked to a sent package/outbox",
+            details=(case.current_delivery_id,),
+        )
+    if (package_kind or "") != DeliveryKind.FINAL_PACKAGE.value:
+        raise DomainError(
+            code=ErrorCode.DELIVERY_GATE_FAILED,
+            message="current delivery must be a final_package send",
+            details=(package_kind or "",),
+        )
 
 
 def apply_transition(
@@ -65,13 +113,16 @@ def apply_transition(
 
             ctx = build_transition_context(case=case, conn=conn)
 
-            # Create/repair send record only when current version is still approved.
-            needs_delivery = target == CaseStatus.SENT_AWAITING_ACK and (
-                case.status != CaseStatus.SENT_AWAITING_ACK
-                or not case.current_delivery_id
+            entering_sent = (
+                target == CaseStatus.SENT_AWAITING_ACK
+                and case.status != CaseStatus.SENT_AWAITING_ACK
             )
-            if needs_delivery:
+            if entering_sent:
                 _assert_send_authorized(ctx)
+                _require_bound_final_delivery(conn, case=case)
+
+            if target == CaseStatus.DELIVERED and case.status != CaseStatus.DELIVERED:
+                _require_bound_final_delivery(conn, case=case)
 
             validate_transition(case.status, target, ctx)
 
@@ -102,19 +153,8 @@ def apply_transition(
                 CaseStatus.DELIVERED,
             } and case.status != target
 
-            delivery_id: str | None = None
-            if needs_delivery:
-                delivery_id = uuid.uuid4().hex
-                conn.execute(
-                    """
-                    INSERT INTO case_deliveries (
-                        id, tenant_id, case_id, case_version,
-                        sent_at, simulated_send
-                    ) VALUES (%s, %s, %s, %s, NOW(), TRUE)
-                    """,
-                    (delivery_id, tenant_id, case_id, case.case_version),
-                )
-
+            # Never invent a simulated delivery on status change — current_delivery_id
+            # is owned by the final-package send path.
             updated = persist_case_status(
                 conn=conn,
                 tenant_id=tenant_id,
@@ -123,7 +163,6 @@ def apply_transition(
                 expected_case_version=case.case_version,
                 status=target,
                 resume_status=new_resume,
-                current_delivery_id=delivery_id if needs_delivery else ...,
                 bump_closure_seq=entering_closure,
             )
             return updated
@@ -142,6 +181,9 @@ def list_allowed_targets(
     allowed: list[CaseStatus] = []
     for target in sorted(candidates, key=lambda s: s.value):
         try:
+            if target == CaseStatus.SENT_AWAITING_ACK and case.status != target:
+                with psycopg.connect(database_url) as conn:
+                    _require_bound_final_delivery(conn, case=case)
             validate_transition(case.status, target, ctx)
         except DomainError:
             continue

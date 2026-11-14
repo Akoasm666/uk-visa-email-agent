@@ -596,7 +596,7 @@ class RulesApiTests(unittest.TestCase):
         self.assertFalse(ev.json()["data"]["all_required_clear"])
 
         root = self.client.get("/")
-        self.assertEqual(root.json()["data"]["stage"], "S3")
+        self.assertEqual(root.json()["data"]["stage"], "S4")
 
 
 if __name__ == "__main__":

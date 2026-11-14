@@ -18,9 +18,13 @@ from visa_agent.case_service import (
     set_takeover,
 )
 from visa_agent.case_service.service import bump_case_version
-from visa_agent.domain.enums import CaseStatus, ErrorCode
+from visa_agent.config import Settings
+from visa_agent.delivery import assemble_package
+from visa_agent.document_pipeline import attach_evidence, set_evidence_quarantine
+from visa_agent.domain.enums import CaseStatus, DeliveryKind, ErrorCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.email_adapter.inbound import InboundEmail, persist_inbound
+from visa_agent.send_control import PackageSendRequest, send_case_package
 from visa_agent.storage.files import LocalFileStore
 from visa_agent.storage.migrate import apply_migrations
 from visa_agent.workflow.transitions import apply_transition, list_allowed_targets
@@ -91,6 +95,100 @@ def _walk_to_ready(case_id: str) -> None:
         case_id=case_id,
         target=CaseStatus.READY_TO_DELIVER,
     )
+
+
+def _accept_evidence(case_id: str, store: LocalFileStore) -> str:
+    case = get_case(database_url=DB, tenant_id=TENANT, case_id=case_id)
+    ev = attach_evidence(
+        database_url=DB,
+        tenant_id=TENANT,
+        case_id=case_id,
+        file_store=store,
+        data=b"%PDF-s13-final",
+        original_filename="final.pdf",
+        classification="passport",
+        expected_case_version=case.case_version,
+    )
+    case = get_case(database_url=DB, tenant_id=TENANT, case_id=case_id)
+    set_evidence_quarantine(
+        database_url=DB,
+        tenant_id=TENANT,
+        case_id=case_id,
+        evidence_id=ev.id,
+        quarantine_status="accepted_for_review",
+        expected_case_version=case.case_version,
+    )
+    return ev.id
+
+
+def _send_final_package(
+    case_id: str,
+    evidence_id: str,
+    store: LocalFileStore,
+    *,
+    recipient: str = "allow@example.com",
+) -> str:
+    """Assemble + approve + simulate-send a final package; returns delivery id.
+
+    Caller must already be on READY_TO_DELIVER for the current case_version.
+    """
+    case = get_case(database_url=DB, tenant_id=TENANT, case_id=case_id)
+    pkg = assemble_package(
+        database_url=DB,
+        tenant_id=TENANT,
+        case_id=case_id,
+        package_kind=DeliveryKind.FINAL_PACKAGE.value,
+        file_store=store,
+        evidence_ids=[evidence_id],
+        expected_case_version=case.case_version,
+    )
+    record_final_review(
+        database_url=DB,
+        tenant_id=TENANT,
+        case_id=case_id,
+        decision="approve",
+        expected_case_version=_ver(case_id),
+        package_id=pkg.package_id,
+        recipients=[recipient],
+        reviewer_id="s13-reviewer",
+    )
+    settings = Settings(
+        app_host="127.0.0.1",
+        app_port=8000,
+        database_url=DB,
+        file_storage_dir=store.root,
+        tenant_id=TENANT,
+        siliconflow_api_key="",
+        siliconflow_base_url="https://api.siliconflow.cn/v1",
+        siliconflow_model="zai-org/GLM-5.3-Flash",
+        email_smtp_host="",
+        email_smtp_port=587,
+        email_smtp_user="",
+        email_smtp_password="",
+        email_from="",
+        email_imap_host="",
+        email_imap_port=993,
+        email_imap_user="",
+        email_imap_password="",
+        outbound_allowlist=frozenset({recipient}),
+        rule_publish_token="test-token",
+    )
+    result = send_case_package(
+        settings=settings,
+        case_id=case_id,
+        file_store=store,
+        req=PackageSendRequest(
+            package_id=pkg.package_id,
+            recipients=(recipient,),
+            subject="final package",
+            body_text="attached",
+            send_operation_id=f"s13-{uuid.uuid4().hex[:12]}",
+        ),
+    )
+    assert result.status == "simulated", result
+    case = get_case(database_url=DB, tenant_id=TENANT, case_id=case_id)
+    assert case.current_delivery_id
+    return case.current_delivery_id
 
 
 class CaseWorkflowTests(unittest.TestCase):
@@ -217,39 +315,35 @@ class CaseWorkflowTests(unittest.TestCase):
 
     def test_stale_delivery_id_cannot_confirm_new_round(self) -> None:
         case = create_case(database_url=DB, tenant_id=TENANT, title="resend")
+        store = LocalFileStore(Path(tempfile.mkdtemp()) / "files")
+        eid = _accept_evidence(case.id, store)
         _walk_to_ready(case.id)
+        old_delivery = _send_final_package(case.id, eid, store)
         sent1 = apply_transition(
             database_url=DB,
             tenant_id=TENANT,
             case_id=case.id,
             target=CaseStatus.SENT_AWAITING_ACK,
         )
-        old_delivery = sent1.current_delivery_id
-        assert old_delivery is not None
-        # Resend: clear delivery then send again (simulate by bumping back via
-        # ready -> collect is heavy; clear current_delivery and repair send).
-        # Move back to ready_to_deliver then resend after clearing delivery id.
+        self.assertEqual(sent1.current_delivery_id, old_delivery)
         apply_transition(
             database_url=DB,
             tenant_id=TENANT,
             case_id=case.id,
             target=CaseStatus.READY_TO_DELIVER,
         )
-        import psycopg
-
-        with psycopg.connect(DB) as conn:
-            conn.execute(
-                "UPDATE cases SET current_delivery_id = NULL WHERE id = %s",
-                (case.id,),
-            )
-            conn.commit()
+        # Second final send replaces current delivery (same package re-send needs new op).
+        new_delivery = _send_final_package(
+            case.id, eid, store, recipient="allow@example.com"
+        )
+        self.assertNotEqual(new_delivery, old_delivery)
         sent2 = apply_transition(
             database_url=DB,
             tenant_id=TENANT,
             case_id=case.id,
             target=CaseStatus.SENT_AWAITING_ACK,
         )
-        self.assertNotEqual(sent2.current_delivery_id, old_delivery)
+        self.assertEqual(sent2.current_delivery_id, new_delivery)
         with self.assertRaises(DomainError) as ctx:
             record_delivery_receipt(
                 database_url=DB,
@@ -267,16 +361,27 @@ class CaseWorkflowTests(unittest.TestCase):
             expected_case_version=_ver(case.id),
         )
 
-    def test_sent_creates_delivery_and_delivered_needs_receipt(self) -> None:
+    def test_sent_requires_final_package_and_delivered_needs_receipt(self) -> None:
         case = create_case(database_url=DB, tenant_id=TENANT, title="deliver")
+        store = LocalFileStore(Path(tempfile.mkdtemp()) / "files")
+        eid = _accept_evidence(case.id, store)
         _walk_to_ready(case.id)
+        with self.assertRaises(DomainError) as bare:
+            apply_transition(
+                database_url=DB,
+                tenant_id=TENANT,
+                case_id=case.id,
+                target=CaseStatus.SENT_AWAITING_ACK,
+            )
+        self.assertEqual(bare.exception.code, ErrorCode.DELIVERY_GATE_FAILED)
+        delivery_id = _send_final_package(case.id, eid, store)
         sent = apply_transition(
             database_url=DB,
             tenant_id=TENANT,
             case_id=case.id,
             target=CaseStatus.SENT_AWAITING_ACK,
         )
-        self.assertIsNotNone(sent.current_delivery_id)
+        self.assertEqual(sent.current_delivery_id, delivery_id)
         with self.assertRaises(DomainError) as ctx:
             apply_transition(
                 database_url=DB,

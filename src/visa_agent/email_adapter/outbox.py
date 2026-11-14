@@ -17,7 +17,10 @@ from psycopg.errors import UniqueViolation
 from visa_agent.config import Settings
 from visa_agent.domain.enums import OutboundMessageKind
 from visa_agent.domain.models import OutboundGateInput, evaluate_outbound_gate
-from visa_agent.email_adapter.errors import SendStatusUnknownError
+from visa_agent.email_adapter.errors import (
+    SendPartialAcceptedError,
+    SendStatusUnknownError,
+)
 from visa_agent.email_adapter.smtp_client import send_smtp
 
 # Re-export for callers/tests that import from outbox.
@@ -26,7 +29,7 @@ __all__ = ["OutboxRequest", "OutboxResult", "SendStatusUnknownError", "enqueue_a
 SendFn = Callable[[Settings, list[str], str, str], str]
 
 _NO_RESEND_STATUSES = frozenset(
-    {"processing", "provider_accepted", "status_unknown"}
+    {"processing", "provider_accepted", "status_unknown", "partial_accepted"}
 )
 
 
@@ -59,19 +62,35 @@ def build_send_operation_id(
     subject: str,
     body_text: str,
     explicit: str | None = None,
+    case_id: str | None = None,
+    case_version: int | None = None,
+    package_id: str | None = None,
 ) -> str:
     if explicit and explicit.strip():
         return explicit.strip()
-    material = "|".join(
+    # Ordinary replies keep the S1/S3 material (no case/package binding) so
+    # upgraded installs still hit prior outbox rows. Package sends include
+    # case_id + case_version + package_id to avoid cross-package collisions.
+    parts = [
+        tenant_id,
+        kind,
+    ]
+    if package_id:
+        parts.extend(
+            [
+                case_id or "",
+                str(case_version) if case_version is not None else "",
+                package_id,
+            ]
+        )
+    parts.extend(
         [
-            tenant_id,
-            kind,
             ",".join(sorted(r.strip().lower() for r in recipients)),
             subject.strip(),
             body_text.strip(),
         ]
     )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
 def _normalize_recipients(recipients: Any) -> tuple[str, ...]:
@@ -407,6 +426,27 @@ def enqueue_and_maybe_send(
         provider_response = dispatcher(
             settings, frozen_recipients, frozen_subject, frozen_body
         )
+    except SendPartialAcceptedError as exc:
+        status = "partial_accepted"
+        provider_response = (exc.provider_response or str(exc))[:500]
+        with psycopg.connect(settings.database_url) as conn:
+            conn.execute(
+                """
+                UPDATE outbox_messages
+                SET status = %s, provider_response = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                (status, provider_response, outbox_id),
+            )
+            conn.commit()
+        return OutboxResult(
+            outbox_id=outbox_id,
+            status=status,
+            block_reasons=(),
+            provider_response=provider_response,
+            email_event_id=None,
+            send_operation_id=op_id,
+        )
     except SendStatusUnknownError as exc:
         status = "status_unknown"
         provider_response = str(exc)
@@ -482,11 +522,11 @@ def enqueue_and_maybe_send(
                 INSERT INTO email_events (
                     id, tenant_id, direction, provider_message_id,
                     dedupe_key, from_addr, to_addrs, subject, body_text,
-                    case_id, attribution_status
+                    case_id, attribution_status, processing_status
                 ) VALUES (
                     %s, %s, 'outbound', %s,
                     %s, %s, %s::jsonb, %s, %s,
-                    NULL, 'unattributed'
+                    NULL, 'unattributed', 'processed'
                 )
                 """,
                 (

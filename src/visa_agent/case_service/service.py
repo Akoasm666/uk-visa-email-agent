@@ -261,9 +261,12 @@ def build_transition_context(
         if case.current_delivery_id:
             delivery_ok = c.execute(
                 """
-                SELECT id, sent_at, receipt_at, case_version
-                FROM case_deliveries
-                WHERE tenant_id = %s AND case_id = %s AND id = %s
+                SELECT d.id, d.sent_at, d.receipt_at, d.case_version,
+                       d.package_id, d.outbox_id, p.package_kind
+                FROM case_deliveries d
+                LEFT JOIN delivery_packages p
+                  ON p.id = d.package_id AND p.tenant_id = d.tenant_id
+                WHERE d.tenant_id = %s AND d.case_id = %s AND d.id = %s
                 """,
                 (case.tenant_id, case.id, case.current_delivery_id),
             ).fetchone()
@@ -272,6 +275,9 @@ def build_transition_context(
                 and delivery_ok[1] is not None
                 and delivery_ok[2] is not None
                 and delivery_ok[3] == case.case_version
+                and delivery_ok[4]
+                and delivery_ok[5]
+                and (delivery_ok[6] or "") == "final_package"
             ):
                 receipt = (delivery_ok[0],)
 
@@ -550,11 +556,23 @@ def record_final_review(
     decision: str,
     note: str = "",
     expected_case_version: int | None = None,
+    package_id: str | None = None,
+    recipients: list[str] | None = None,
+    reviewer_id: str | None = None,
 ) -> None:
     if decision not in {"approve", "reject"}:
         raise DomainError(
             code=ErrorCode.VALIDATION_ERROR,
             message="decision must be approve or reject",
+        )
+    import json
+
+    pkg_id = (package_id or "").strip() or None
+    actor = (reviewer_id or "").strip() or None
+    recip_json = None
+    if recipients is not None:
+        recip_json = json.dumps(
+            sorted({r.strip().lower() for r in recipients if r.strip()})
         )
     with psycopg.connect(database_url) as conn:
         with conn.transaction():
@@ -566,6 +584,40 @@ def record_final_review(
                 for_update=True,
             )
             _require_version(case, expected_case_version, required=True)
+            if pkg_id is not None:
+                if not actor:
+                    raise DomainError(
+                        code=ErrorCode.UNAUTHORIZED,
+                        message="reviewer_id required for package-bound review",
+                    )
+                owned = conn.execute(
+                    """
+                    SELECT case_version FROM delivery_packages
+                    WHERE tenant_id = %s AND case_id = %s AND id = %s
+                    """,
+                    (tenant_id, case_id, pkg_id),
+                ).fetchone()
+                if owned is None:
+                    raise DomainError(
+                        code=ErrorCode.NOT_FOUND,
+                        message="delivery package not found on case",
+                        details=(pkg_id,),
+                    )
+                if int(owned[0]) != case.case_version:
+                    raise DomainError(
+                        code=ErrorCode.CONFLICT_VERSION,
+                        message="package was assembled for a different case_version",
+                        details=(str(owned[0]), str(case.case_version)),
+                    )
+                if decision == "approve":
+                    approved: list[str] = []
+                    if recip_json:
+                        approved = list(json.loads(recip_json))
+                    if not approved:
+                        raise DomainError(
+                            code=ErrorCode.VALIDATION_ERROR,
+                            message="recipients required for final-package approval",
+                        )
             # Monotonic seq under the case lock — not PostgreSQL txn-start NOW().
             seq_row = conn.execute(
                 """
@@ -583,8 +635,8 @@ def record_final_review(
                 """
                 INSERT INTO case_final_reviews (
                     id, tenant_id, case_id, case_version, decision, note,
-                    decision_seq
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    decision_seq, package_id, recipients, reviewer_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
                 """,
                 (
                     uuid.uuid4().hex,
@@ -594,6 +646,9 @@ def record_final_review(
                     decision,
                     note,
                     decision_seq,
+                    pkg_id,
+                    recip_json,
+                    actor,
                 ),
             )
 
@@ -819,6 +874,32 @@ def record_delivery_receipt(
                         f"current={case.current_delivery_id}",
                     ),
                 )
+            bound = conn.execute(
+                """
+                SELECT d.id, d.package_id, d.outbox_id, p.package_kind
+                FROM case_deliveries d
+                LEFT JOIN delivery_packages p
+                  ON p.id = d.package_id AND p.tenant_id = d.tenant_id
+                WHERE d.tenant_id = %s AND d.case_id = %s AND d.id = %s
+                  AND d.case_version = %s
+                  AND d.sent_at IS NOT NULL
+                """,
+                (tenant_id, case_id, page_delivery, case.case_version),
+            ).fetchone()
+            if (
+                bound is None
+                or not bound[1]
+                or not bound[2]
+                or (bound[3] or "") != "final_package"
+            ):
+                raise DomainError(
+                    code=ErrorCode.DELIVERY_GATE_FAILED,
+                    message=(
+                        "receipt must bind a final_package delivery "
+                        "with outbox linkage"
+                    ),
+                    details=(page_delivery,),
+                )
             updated = conn.execute(
                 """
                 UPDATE case_deliveries
@@ -826,6 +907,8 @@ def record_delivery_receipt(
                 WHERE tenant_id = %s AND case_id = %s AND id = %s
                   AND case_version = %s
                   AND sent_at IS NOT NULL
+                  AND package_id IS NOT NULL
+                  AND outbox_id IS NOT NULL
                 RETURNING id
                 """,
                 (tenant_id, case_id, page_delivery, case.case_version),
@@ -841,6 +924,96 @@ def record_delivery_receipt(
                 )
 
 
+_INBOUND_CONCLUSIONS = frozenset(
+    {"acknowledged", "stop_delivery", "material_change"}
+)
+_INBOUND_CONCLUSIONS_INVALIDATE = frozenset({"stop_delivery", "material_change"})
+
+
+def mark_inbound_processed(
+    *,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+    email_event_id: str,
+    conclusion: str,
+    processed_by: str,
+    expected_case_version: int | None = None,
+) -> CaseRecord:
+    """Explicit authorized action that clears the unprocessed-inbound send gate.
+
+    ``stop_delivery`` / ``material_change`` bump ``case_version`` so prior package
+    approvals and confirmations no longer authorize send.
+    """
+    conclusion_key = (conclusion or "").strip().lower()
+    actor = (processed_by or "").strip()
+    if conclusion_key not in _INBOUND_CONCLUSIONS:
+        raise DomainError(
+            code=ErrorCode.VALIDATION_ERROR,
+            message="invalid inbound processing conclusion",
+            details=(conclusion_key,),
+        )
+    if not actor:
+        raise DomainError(
+            code=ErrorCode.UNAUTHORIZED,
+            message="processed_by (actor) required to mark inbound processed",
+        )
+    with psycopg.connect(database_url) as conn:
+        with conn.transaction():
+            case = get_case(
+                database_url=database_url,
+                tenant_id=tenant_id,
+                case_id=case_id,
+                conn=conn,
+                for_update=True,
+            )
+            _require_version(case, expected_case_version, required=True)
+            row = conn.execute(
+                """
+                SELECT id, attribution_status, processing_status
+                FROM email_events
+                WHERE tenant_id = %s AND id = %s
+                  AND direction = 'inbound'
+                  AND case_id = %s
+                FOR UPDATE
+                """,
+                (tenant_id, email_event_id, case_id),
+            ).fetchone()
+            if row is None:
+                raise DomainError(
+                    code=ErrorCode.NOT_FOUND,
+                    message="inbound email not found on case",
+                    details=(email_event_id,),
+                )
+            if (row[1] or "") != "attributed":
+                raise DomainError(
+                    code=ErrorCode.VALIDATION_ERROR,
+                    message="inbound must be attributed before it can be marked processed",
+                    details=(row[1] or "",),
+                )
+            conn.execute(
+                """
+                UPDATE email_events
+                SET processing_status = 'processed',
+                    processing_conclusion = %s,
+                    processed_by = %s,
+                    processed_at = NOW()
+                WHERE tenant_id = %s AND id = %s
+                """,
+                (conclusion_key, actor, tenant_id, email_event_id),
+            )
+            if conclusion_key in _INBOUND_CONCLUSIONS_INVALIDATE:
+                bump_case_version_in_conn(
+                    conn=conn,
+                    database_url=database_url,
+                    tenant_id=tenant_id,
+                    case_id=case_id,
+                    expected_case_version=case.case_version,
+                    required=True,
+                )
+    return get_case(database_url=database_url, tenant_id=tenant_id, case_id=case_id)
+
+
 def attribute_inbound_to_case(
     *,
     database_url: str,
@@ -850,9 +1023,32 @@ def attribute_inbound_to_case(
     force_reattribute: bool = False,
     reason: str = "",
 ) -> None:
-    get_case(database_url=database_url, tenant_id=tenant_id, case_id=case_id)
     with psycopg.connect(database_url) as conn:
         with conn.transaction():
+            # Serialize with send claim so attribution cannot slip between gate and claim.
+            get_case(
+                database_url=database_url,
+                tenant_id=tenant_id,
+                case_id=case_id,
+                conn=conn,
+                for_update=True,
+            )
+            busy = conn.execute(
+                """
+                SELECT 1 FROM outbox_messages
+                WHERE tenant_id = %s AND case_id = %s AND status = 'processing'
+                LIMIT 1
+                """,
+                (tenant_id, case_id),
+            ).fetchone()
+            if busy is not None:
+                raise DomainError(
+                    code=ErrorCode.CONFLICT_VERSION,
+                    message=(
+                        "case has a send in processing; "
+                        "finish or fail it before attributing inbound"
+                    ),
+                )
             row = conn.execute(
                 """
                 SELECT id, case_id, attribution_status
@@ -873,7 +1069,9 @@ def attribute_inbound_to_case(
                 conn.execute(
                     """
                     UPDATE email_events
-                    SET case_id = %s, attribution_status = 'attributed'
+                    SET case_id = %s,
+                        attribution_status = 'attributed',
+                        processing_status = 'unprocessed'
                     WHERE tenant_id = %s AND id = %s
                     """,
                     (case_id, tenant_id, email_event_id),
@@ -933,7 +1131,9 @@ def attribute_inbound_to_case(
             conn.execute(
                 """
                 UPDATE email_events
-                SET case_id = %s, attribution_status = 'attributed'
+                SET case_id = %s,
+                    attribution_status = 'attributed',
+                    processing_status = 'unprocessed'
                 WHERE tenant_id = %s AND id = %s
                 """,
                 (case_id, tenant_id, email_event_id),

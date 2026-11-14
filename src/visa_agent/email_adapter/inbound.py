@@ -236,11 +236,11 @@ def persist_inbound(
                     INSERT INTO email_events (
                         id, tenant_id, direction, provider_message_id, rfc_message_id,
                         dedupe_key, from_addr, to_addrs, subject, body_text, raw_file_id,
-                        case_id, claimed_case_id, attribution_status
+                        case_id, claimed_case_id, attribution_status, processing_status
                     ) VALUES (
                         %s, %s, 'inbound', %s, %s,
                         %s, %s, %s::jsonb, %s, %s, NULL,
-                        NULL, %s, 'unattributed'
+                        NULL, %s, 'unattributed', 'unprocessed'
                     )
                     ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
                     RETURNING id, attribution_status

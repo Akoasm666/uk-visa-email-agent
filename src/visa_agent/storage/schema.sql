@@ -16,9 +16,31 @@ CREATE TABLE IF NOT EXISTS email_events (
     claimed_case_id TEXT,
     attribution_status TEXT NOT NULL DEFAULT 'unattributed'
         CHECK (attribution_status IN ('attributed', 'unattributed', 'duplicate')),
+    processing_status TEXT NOT NULL DEFAULT 'processed'
+        CHECK (processing_status IN ('unprocessed', 'processed')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (tenant_id, dedupe_key)
 );
+
+-- Inbound starts unprocessed; outbound/legacy rows default to processed.
+ALTER TABLE email_events ADD COLUMN IF NOT EXISTS processing_status TEXT;
+UPDATE email_events
+SET processing_status = CASE
+    WHEN direction = 'inbound' THEN COALESCE(processing_status, 'unprocessed')
+    ELSE COALESCE(processing_status, 'processed')
+END
+WHERE processing_status IS NULL;
+ALTER TABLE email_events ALTER COLUMN processing_status SET DEFAULT 'processed';
+UPDATE email_events SET processing_status = 'processed' WHERE processing_status IS NULL;
+ALTER TABLE email_events ALTER COLUMN processing_status SET NOT NULL;
+ALTER TABLE email_events DROP CONSTRAINT IF EXISTS email_events_processing_status_check;
+ALTER TABLE email_events
+    ADD CONSTRAINT email_events_processing_status_check
+    CHECK (processing_status IN ('unprocessed', 'processed'));
+
+ALTER TABLE email_events ADD COLUMN IF NOT EXISTS processing_conclusion TEXT;
+ALTER TABLE email_events ADD COLUMN IF NOT EXISTS processed_by TEXT;
+ALTER TABLE email_events ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_email_events_created
     ON email_events (tenant_id, created_at DESC);
@@ -69,7 +91,7 @@ ALTER TABLE outbox_messages
     ADD CONSTRAINT outbox_messages_status_check
     CHECK (status IN (
         'pending', 'blocked', 'processing', 'provider_accepted',
-        'failed', 'status_unknown'
+        'failed', 'status_unknown', 'simulated', 'partial_accepted'
     ));
 
 -- S1.3 case persistence + workbench support
@@ -120,6 +142,11 @@ CREATE TABLE IF NOT EXISTS case_final_reviews (
     decision_seq INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- S4: final-package approval binds package_id + recipients (nullable for legacy reviews)
+ALTER TABLE case_final_reviews ADD COLUMN IF NOT EXISTS package_id TEXT;
+ALTER TABLE case_final_reviews ADD COLUMN IF NOT EXISTS recipients JSONB;
+ALTER TABLE case_final_reviews ADD COLUMN IF NOT EXISTS reviewer_id TEXT;
 
 -- S2.3: keep every decision; gate uses lock-allocated decision_seq (not txn start time).
 ALTER TABLE case_final_reviews
@@ -199,6 +226,8 @@ CREATE TABLE IF NOT EXISTS case_deliveries (
 
 ALTER TABLE case_deliveries ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
 ALTER TABLE case_deliveries ADD COLUMN IF NOT EXISTS simulated_send BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE case_deliveries ADD COLUMN IF NOT EXISTS package_id TEXT;
+ALTER TABLE case_deliveries ADD COLUMN IF NOT EXISTS outbox_id TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_case_deliveries_case
     ON case_deliveries (tenant_id, case_id, created_at DESC);
@@ -319,3 +348,18 @@ CREATE INDEX IF NOT EXISTS idx_case_requirement_states_case
 
 ALTER TABLE cases ADD COLUMN IF NOT EXISTS active_pack_id TEXT;
 ALTER TABLE cases ADD COLUMN IF NOT EXISTS active_pack_version INTEGER;
+
+-- S4 W09: immutable delivery packages (manifest + hashes from accepted evidence)
+CREATE TABLE IF NOT EXISTS delivery_packages (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    case_id TEXT NOT NULL REFERENCES cases(id),
+    case_version INTEGER NOT NULL,
+    package_kind TEXT NOT NULL,
+    manifest_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    manifest_digest TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_delivery_packages_case
+    ON delivery_packages (tenant_id, case_id, created_at DESC);

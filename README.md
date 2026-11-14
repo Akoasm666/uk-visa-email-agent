@@ -5,13 +5,13 @@
 
 ## 当前阶段
 
-**S3 已通过**（Visitor W06-V + 模型网关 W07）。下一阶段：**S4 材料包组装 + 发送控制**（粗粒度，一次验收）。
-
-S3 规则门控在 **`standard_visitor` v2**；发布后换绑走 impact / `set_case_active_pack`。v1 行为冻结不变。
+**S4 已验收**：材料包组装（W09）+ 发送控制（W10）。
 
 | 交付物 | 路径 |
 |---|---|
-| Visitor 场景 | `GET/POST /visitor-scenarios`（`/run` 为别名）· `rules/visitor_pack.py` |
+| 材料包组装 | `POST /cases/{id}/packages/assemble` · `delivery/` |
+| 包发送 | `POST /cases/{id}/packages/{package_id}/send` · `send_control/` |
+| Visitor 场景 | `GET/POST /visitor-scenarios` · `rules/visitor_pack.py` |
 | 模型网关 | `ai_capabilities/gateway.py` · `GET /cases/{id}/draft/groundedness` |
 | 冻结契约 | `docs/` + `src/visa_agent/domain/` |
 | 审核台 | `GET /cases/{id}/review-board` · 工作台案件详情 |
@@ -45,7 +45,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 阶段约定（摘要）
 
-- **S3**：Visitor 标准/转人工/反例（禁 Student 资金公式）；模型输出须 grounded，禁止宣称发送/批准
+- **S4**：仅 `accepted_for_review` 证据可入包；最终包审批绑定 version+package_id+收件人；发送前复核清单哈希
+- **S3**：Visitor 标准/转人工/反例；模型仅落结构化字段 + 模板正文
 - **S2.3**：确认/审批历史；`decision_seq` 定最新决定；可重复读快照；驳回门控显示「已驳回」
 - **S2.2**：规则包人工发布（`RULE_PUBLISH_TOKEN`）；未知 ≠ 通过；隔离库 `visa_agent_test`
 - **S1**：SMTP + 白名单；模型草稿仅合成上下文

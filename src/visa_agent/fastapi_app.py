@@ -1,4 +1,4 @@
-"""FastAPI entrypoint for S3."""
+"""FastAPI entrypoint for S4."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from visa_agent.case_service import (
     get_case_review_page,
     get_review_board,
     list_cases,
+    mark_inbound_processed,
     record_customer_confirmation,
     record_delivery_receipt,
     record_final_review,
@@ -65,7 +66,7 @@ from visa_agent.storage.migrate import apply_migrations
 from visa_agent.workbench.pages import render_detail, render_list
 from visa_agent.workflow.transitions import apply_transition, list_allowed_targets
 
-app = FastAPI(title="visa-email-agent", version="0.8.0")
+app = FastAPI(title="visa-email-agent", version="0.9.0")
 
 
 def bootstrap(settings: Settings | None = None) -> Settings:
@@ -124,6 +125,23 @@ class ReviewBody(BaseModel):
     decision: str
     note: str = ""
     expected_case_version: int
+    package_id: str | None = None
+    recipients: list[str] | None = None
+    reviewer_id: str | None = None
+
+
+class AssemblePackageBody(BaseModel):
+    package_kind: str
+    expected_case_version: int
+    evidence_ids: list[str] | None = None
+
+
+class PackageSendBody(BaseModel):
+    recipients: list[str]
+    subject: str
+    body_text: str
+    send_operation_id: str | None = None
+    send_now: bool = True
 
 
 class ConfirmBody(BaseModel):
@@ -134,6 +152,13 @@ class AttributeBody(BaseModel):
     email_event_id: str
     force_reattribute: bool = False
     reason: str = ""
+
+
+class MarkInboundProcessedBody(BaseModel):
+    email_event_id: str
+    expected_case_version: int
+    conclusion: str
+    processed_by: str
 
 
 class PollBody(BaseModel):
@@ -274,7 +299,7 @@ def root() -> dict[str, Any]:
         "success": True,
         "data": {
             "service": "visa-email-agent",
-            "stage": "S3",
+            "stage": "S4",
             "workbench": "/workbench",
             "docs": "/health",
         },
@@ -470,8 +495,20 @@ def api_confirm(case_id: str, body: ConfirmBody) -> dict[str, Any]:
 
 
 @app.post("/cases/{case_id}/reviews")
-def api_review(case_id: str, body: ReviewBody) -> dict[str, Any]:
+def api_review(case_id: str, body: ReviewBody, request: Request) -> dict[str, Any]:
     settings = get_settings()
+    if body.package_id:
+        provided = request.headers.get("X-Rule-Publish-Token", "")
+        auth = request.headers.get("Authorization", "")
+        if not provided and auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
+        if not settings.rule_publish_enabled or provided != settings.rule_publish_token:
+            raise _domain_http(
+                DomainError(
+                    code=ErrorCode.UNAUTHORIZED,
+                    message="package review requires a valid review/publish token",
+                )
+            )
     try:
         record_final_review(
             database_url=settings.database_url,
@@ -480,6 +517,9 @@ def api_review(case_id: str, body: ReviewBody) -> dict[str, Any]:
             decision=body.decision,
             note=body.note,
             expected_case_version=body.expected_case_version,
+            package_id=body.package_id,
+            recipients=body.recipients,
+            reviewer_id=body.reviewer_id,
         )
         case = get_case(
             database_url=settings.database_url,
@@ -557,6 +597,48 @@ def api_attribute(case_id: str, body: AttributeBody) -> dict[str, Any]:
     return {
         "success": True,
         "data": {"case_id": case_id, "email_event_id": body.email_event_id},
+    }
+
+
+@app.post("/cases/{case_id}/inbound/mark-processed")
+def api_mark_inbound_processed(
+    case_id: str, body: MarkInboundProcessedBody, request: Request
+) -> dict[str, Any]:
+    """Authorized action that clears the unprocessed-inbound outbound gate."""
+    settings = get_settings()
+    provided = request.headers.get("X-Rule-Publish-Token", "")
+    auth = request.headers.get("Authorization", "")
+    if not provided and auth.lower().startswith("bearer "):
+        provided = auth[7:].strip()
+    if not settings.rule_publish_enabled or provided != settings.rule_publish_token:
+        raise _domain_http(
+            DomainError(
+                code=ErrorCode.UNAUTHORIZED,
+                message="mark-processed requires a valid review/publish token",
+            )
+        )
+    try:
+        case = mark_inbound_processed(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            email_event_id=body.email_event_id,
+            conclusion=body.conclusion,
+            processed_by=body.processed_by,
+            expected_case_version=body.expected_case_version,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {
+        "success": True,
+        "data": {
+            "case_id": case_id,
+            "email_event_id": body.email_event_id,
+            "processing_status": "processed",
+            "processing_conclusion": body.conclusion,
+            "processed_by": body.processed_by,
+            "case_version": case.case_version,
+        },
     }
 
 
@@ -890,6 +972,99 @@ def api_evaluate_requirements(case_id: str) -> dict[str, Any]:
             "blocking_keys": list(result.blocking_keys),
             "all_required_clear": result.all_required_clear,
             "states": [_req_state_payload(s) for s in result.states],
+        },
+    }
+
+
+@app.post("/cases/{case_id}/packages/assemble")
+def api_assemble_package(case_id: str, body: AssemblePackageBody) -> dict[str, Any]:
+    """W09: snapshot accepted evidence into an immutable delivery package."""
+    from visa_agent.delivery import assemble_package
+
+    settings = get_settings()
+    try:
+        pkg = assemble_package(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            package_kind=body.package_kind,
+            file_store=LocalFileStore(settings.file_storage_dir),
+            evidence_ids=body.evidence_ids,
+            expected_case_version=body.expected_case_version,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {
+        "success": True,
+        "data": {
+            "package_id": pkg.package_id,
+            "case_id": pkg.case_id,
+            "case_version": pkg.case_version,
+            "package_kind": pkg.package_kind,
+            "manifest_digest": pkg.manifest_digest,
+            "items": pkg.manifest_payload(),
+        },
+    }
+
+
+@app.get("/cases/{case_id}/packages/{package_id}")
+def api_get_package(case_id: str, package_id: str) -> dict[str, Any]:
+    from visa_agent.delivery import get_package
+
+    settings = get_settings()
+    try:
+        pkg = get_package(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            package_id=package_id,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {
+        "success": True,
+        "data": {
+            "package_id": pkg.package_id,
+            "case_id": pkg.case_id,
+            "case_version": pkg.case_version,
+            "package_kind": pkg.package_kind,
+            "manifest_digest": pkg.manifest_digest,
+            "items": pkg.manifest_payload(),
+        },
+    }
+
+
+@app.post("/cases/{case_id}/packages/{package_id}/send")
+def api_send_package(case_id: str, package_id: str, body: PackageSendBody) -> dict[str, Any]:
+    """W10: send a delivery package; kind/hashes come from the saved package."""
+    from visa_agent.send_control import PackageSendRequest, send_case_package
+
+    settings = get_settings()
+    try:
+        result = send_case_package(
+            settings=settings,
+            case_id=case_id,
+            file_store=LocalFileStore(settings.file_storage_dir),
+            req=PackageSendRequest(
+                package_id=package_id,
+                recipients=tuple(body.recipients),
+                subject=body.subject,
+                body_text=body.body_text,
+                send_operation_id=body.send_operation_id,
+                send_now=body.send_now,
+            ),
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {
+        "success": True,
+        "data": {
+            "outbox_id": result.outbox_id,
+            "status": result.status,
+            "block_reasons": list(result.block_reasons),
+            "provider_response": result.provider_response,
+            "send_operation_id": result.send_operation_id,
+            "package_id": package_id,
         },
     }
 
