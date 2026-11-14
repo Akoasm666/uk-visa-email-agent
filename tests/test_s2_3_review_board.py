@@ -427,7 +427,7 @@ class ReviewBoardApiTests(unittest.TestCase):
         self.assertTrue(data3["final_approval_effective"])
 
         root = self.client.get("/")
-        self.assertEqual(root.json()["data"]["stage"], "S2.3")
+        self.assertEqual(root.json()["data"]["stage"], "S3")
 
 
 if __name__ == "__main__":

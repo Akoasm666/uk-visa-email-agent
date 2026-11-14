@@ -18,9 +18,12 @@ from visa_agent.domain.errors import DomainError
 from visa_agent.rules.seed import (
     VISITOR_PACK_ID,
     VISITOR_PACK_TITLE,
+    VISITOR_PACK_TITLE_S3,
     VISITOR_PACK_VERSION,
+    VISITOR_PACK_VERSION_S3,
     VISITOR_REQUIREMENTS,
     VISITOR_SOURCE_RETRIEVED_ON,
+    VISITOR_SOURCE_RETRIEVED_ON_S3,
     VISITOR_SOURCE_URL,
 )
 
@@ -113,11 +116,65 @@ def _row_to_pack(row: tuple, reqs: list[tuple]) -> RulePack:
     )
 
 
-def ensure_seed_visitor_pack(*, database_url: str) -> RulePack:
-    """Insert Visitor pack v1 only when that version is absent.
+def _insert_visitor_pack_version(
+    conn: psycopg.Connection,
+    *,
+    pack_version: int,
+    title: str,
+    retrieved_on: str,
+) -> None:
+    """Insert one pack version if absent. Never updates existing rows."""
+    existing = conn.execute(
+        """
+        SELECT pack_id FROM rule_packs
+        WHERE pack_id = %s AND pack_version = %s
+        """,
+        (VISITOR_PACK_ID, pack_version),
+    ).fetchone()
+    if existing is not None:
+        return
+    conn.execute(
+        """
+        INSERT INTO rule_packs (
+            pack_id, pack_version, route, title,
+            source_url, source_retrieved_on, published
+        ) VALUES (%s, %s, %s, %s, %s, %s, FALSE)
+        """,
+        (
+            VISITOR_PACK_ID,
+            pack_version,
+            RouteCode.STANDARD_VISITOR.value,
+            title,
+            VISITOR_SOURCE_URL,
+            date.fromisoformat(retrieved_on),
+        ),
+    )
+    for req in VISITOR_REQUIREMENTS:
+        conn.execute(
+            """
+            INSERT INTO rule_requirements (
+                id, pack_id, pack_version, requirement_key,
+                title, description, severity
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                uuid.uuid4().hex,
+                VISITOR_PACK_ID,
+                pack_version,
+                req.key,
+                req.title,
+                req.description,
+                req.severity,
+            ),
+        )
 
-    Never mutates an existing pack (published or not). Rule content changes
-    must be introduced as a new pack_version and published explicitly.
+
+def ensure_seed_visitor_pack(*, database_url: str) -> RulePack:
+    """Insert Visitor pack v1 and S3 v2 when absent.
+
+    Never mutates an existing pack (published or not). S3 evaluator changes
+    live on v2 — publish + rebind via impact scan / set_case_active_pack.
+    Returns v1 for backward-compatible callers.
     """
     with psycopg.connect(database_url) as conn:
         with conn.transaction():
@@ -125,54 +182,18 @@ def ensure_seed_visitor_pack(*, database_url: str) -> RulePack:
                 "SELECT pg_advisory_xact_lock(%s, %s)",
                 (_SEED_LOCK_K1, _SEED_LOCK_K2),
             )
-            existing = conn.execute(
-                """
-                SELECT pack_id FROM rule_packs
-                WHERE pack_id = %s AND pack_version = %s
-                """,
-                (VISITOR_PACK_ID, VISITOR_PACK_VERSION),
-            ).fetchone()
-            if existing is not None:
-                return get_rule_pack(
-                    database_url=database_url,
-                    pack_id=VISITOR_PACK_ID,
-                    pack_version=VISITOR_PACK_VERSION,
-                    conn=conn,
-                )
-            conn.execute(
-                """
-                INSERT INTO rule_packs (
-                    pack_id, pack_version, route, title,
-                    source_url, source_retrieved_on, published
-                ) VALUES (%s, %s, %s, %s, %s, %s, FALSE)
-                """,
-                (
-                    VISITOR_PACK_ID,
-                    VISITOR_PACK_VERSION,
-                    RouteCode.STANDARD_VISITOR.value,
-                    VISITOR_PACK_TITLE,
-                    VISITOR_SOURCE_URL,
-                    date.fromisoformat(VISITOR_SOURCE_RETRIEVED_ON),
-                ),
+            _insert_visitor_pack_version(
+                conn,
+                pack_version=VISITOR_PACK_VERSION,
+                title=VISITOR_PACK_TITLE,
+                retrieved_on=VISITOR_SOURCE_RETRIEVED_ON,
             )
-            for req in VISITOR_REQUIREMENTS:
-                conn.execute(
-                    """
-                    INSERT INTO rule_requirements (
-                        id, pack_id, pack_version, requirement_key,
-                        title, description, severity
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        uuid.uuid4().hex,
-                        VISITOR_PACK_ID,
-                        VISITOR_PACK_VERSION,
-                        req.key,
-                        req.title,
-                        req.description,
-                        req.severity,
-                    ),
-                )
+            _insert_visitor_pack_version(
+                conn,
+                pack_version=VISITOR_PACK_VERSION_S3,
+                title=VISITOR_PACK_TITLE_S3,
+                retrieved_on=VISITOR_SOURCE_RETRIEVED_ON_S3,
+            )
     return get_rule_pack(
         database_url=database_url,
         pack_id=VISITOR_PACK_ID,
@@ -407,24 +428,60 @@ def _hint_status_for_requirement(
     severity: str,
     classifications: set[str],
     annotation_keys: set[str],
+    annotation_pairs: list | None = None,
+    pack_version: int = 1,
 ) -> tuple[str, str]:
     """Demo heuristic: map isolated evidence / annotations to requirement states.
 
     Unknown stays unknown — never treated as pass.
+    Pack v1: legacy key-presence transfer; no student-funds formula gate.
+    Pack v2+ (S3): shared visitor_pack polarity + funds-context formula gate.
     """
-    if severity == "transfer_human":
-        if any(
-            k.startswith("transfer_") or k == "transfer_human_triggers"
-            for k in annotation_keys
-        ):
+    from visa_agent.rules.visitor_pack import (
+        AnnotationPair,
+        assess_visitor_signals,
+        detect_transfer_triggers,
+    )
+
+    pairs: list[AnnotationPair] = list(annotation_pairs or [])
+
+    if pack_version >= VISITOR_PACK_VERSION_S3:
+        assessment = assess_visitor_signals(
+            classifications=classifications,
+            annotations=pairs,
+        )
+        if severity == "transfer_human":
+            if assessment.transfer_polarity == "affirmative":
+                return (
+                    RequirementStatus.NEEDS_CORRECTION.value,
+                    "transfer-to-human trigger affirmative; human review required",
+                )
+            if assessment.transfer_polarity == "negative":
+                return (
+                    RequirementStatus.NOT_APPLICABLE.value,
+                    "transfer triggers assessed negative / not applicable",
+                )
+            return (
+                RequirementStatus.APPLICABILITY_UNKNOWN.value,
+                "transfer-human applicability not yet assessed",
+            )
+        if requirement_key == "funds_for_stay" and assessment.student_funds_hits:
             return (
                 RequirementStatus.NEEDS_CORRECTION.value,
-                "transfer-to-human trigger annotated; human review required",
+                "Student fixed-funds / CAS formula citation rejected for Visitor",
             )
-        return (
-            RequirementStatus.APPLICABILITY_UNKNOWN.value,
-            "transfer-human applicability not yet assessed",
-        )
+    else:
+        # v1 frozen behaviour: key presence only; no student-funds formula gate.
+        if severity == "transfer_human":
+            if detect_transfer_triggers(annotation_keys):
+                return (
+                    RequirementStatus.NEEDS_CORRECTION.value,
+                    "transfer-to-human trigger annotated; human review required",
+                )
+            return (
+                RequirementStatus.APPLICABILITY_UNKNOWN.value,
+                "transfer-human applicability not yet assessed",
+            )
 
     matched_class = any(
         _CLASSIFICATION_HINTS.get(c) == requirement_key for c in classifications
@@ -527,7 +584,7 @@ def evaluate_case_requirements(
             }
             ann_rows = conn.execute(
                 """
-                SELECT a.field_key
+                SELECT a.field_key, a.field_value
                 FROM evidence_annotations a
                 JOIN case_evidence e
                   ON e.tenant_id = a.tenant_id
@@ -538,7 +595,16 @@ def evaluate_case_requirements(
                 """,
                 (tenant_id, case_id),
             ).fetchall()
+            from visa_agent.rules.visitor_pack import AnnotationPair
+
             annotation_keys = {(r[0] or "").strip().lower() for r in ann_rows}
+            annotation_pairs = [
+                AnnotationPair(
+                    key=(r[0] or "").strip().lower(),
+                    value=(r[1] or "").strip(),
+                )
+                for r in ann_rows
+            ]
 
             # Re-read binding after evidence reads; refuse stale pack writes.
             binding_now = _load_case_pack_binding(
@@ -569,6 +635,8 @@ def evaluate_case_requirements(
                     severity=req.severity,
                     classifications=classifications,
                     annotation_keys=annotation_keys,
+                    annotation_pairs=annotation_pairs,
+                    pack_version=pack.pack_version,
                 )
                 states.append(
                     CaseRequirementState(

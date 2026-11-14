@@ -135,7 +135,9 @@ class DraftUnitTests(unittest.TestCase):
             after = get_case(
                 database_url=DB, tenant_id=TENANT, case_id=case.id
             )
-        self.assertIn("合成演示草稿", result.draft_text)
+        # Freeform model prose is discarded; only field-bound template is stored.
+        self.assertIn("已校验字段 visit_purpose", result.draft_text)
+        self.assertNotIn("合成演示草稿", result.draft_text)
         self.assertEqual(result.case_version, before.case_version)
         self.assertEqual(after.status, before.status)
         self.assertEqual(after.case_version, before.case_version)
@@ -224,7 +226,8 @@ class DraftHttpTests(unittest.TestCase):
             resp = self.client.post(f"/cases/{case_id}/draft")
         self.assertEqual(resp.status_code, 200)
         data = resp.json()["data"]
-        self.assertEqual(data["draft_text"], "Workbench draft body")
+        self.assertIn("已校验字段 visit_purpose", data["draft_text"])
+        self.assertNotEqual(data["draft_text"], "Workbench draft body")
         self.assertTrue(data["model_call_id"])
 
     def test_workbench_marks_stale_draft_as_historical_after_bump(self) -> None:

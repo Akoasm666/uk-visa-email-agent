@@ -15,13 +15,19 @@ class SeedRequirement:
 
 VISITOR_PACK_ID = "standard_visitor"
 VISITOR_PACK_VERSION = 1
+# S3: polarity + funds-context evaluator; publish + rebind via impact/switch flow.
+VISITOR_PACK_VERSION_S3 = 2
 VISITOR_PACK_TITLE = "Standard Visitor — core genuine-visitor themes"
+VISITOR_PACK_TITLE_S3 = (
+    "Standard Visitor — S3 polarity + student-funds context gates"
+)
 VISITOR_SOURCE_URL = (
     "https://www.gov.uk/government/publications/"
     "visitor-visa-guide-to-supporting-documents/"
     "guide-to-supporting-documents-visiting-the-uk"
 )
 VISITOR_SOURCE_RETRIEVED_ON = "2026-11-14"
+VISITOR_SOURCE_RETRIEVED_ON_S3 = "2026-11-15"
 
 VISITOR_REQUIREMENTS: tuple[SeedRequirement, ...] = (
     SeedRequirement(

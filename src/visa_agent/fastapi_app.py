@@ -1,4 +1,4 @@
-"""FastAPI entrypoint for S2."""
+"""FastAPI entrypoint for S3."""
 
 from __future__ import annotations
 
@@ -11,7 +11,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from visa_agent.ai_capabilities import generate_case_draft, list_case_drafts
+from visa_agent.ai_capabilities import (
+    context_from_stored_payload,
+    generate_case_draft,
+    groundedness_report,
+    list_case_drafts,
+)
+from visa_agent.ai_capabilities.draft import load_latest_draft_audit
 from visa_agent.case_service import (
     attribute_inbound_to_case,
     create_case,
@@ -59,7 +65,7 @@ from visa_agent.storage.migrate import apply_migrations
 from visa_agent.workbench.pages import render_detail, render_list
 from visa_agent.workflow.transitions import apply_transition, list_allowed_targets
 
-app = FastAPI(title="visa-email-agent", version="0.7.0")
+app = FastAPI(title="visa-email-agent", version="0.8.0")
 
 
 def bootstrap(settings: Settings | None = None) -> Settings:
@@ -268,7 +274,7 @@ def root() -> dict[str, Any]:
         "success": True,
         "data": {
             "service": "visa-email-agent",
-            "stage": "S2.3",
+            "stage": "S3",
             "workbench": "/workbench",
             "docs": "/health",
         },
@@ -790,6 +796,79 @@ def api_bind_active_pack(case_id: str, body: BindPackBody) -> dict[str, Any]:
     }
 
 
+class AnnotationPairBody(BaseModel):
+    key: str
+    value: str = ""
+
+
+class VisitorScenarioBody(BaseModel):
+    scenario_id: str = "standard_adult_tourist"
+    classifications: list[str] = []
+    annotations: list[AnnotationPairBody] = []
+    annotation_keys: list[str] = []
+    annotation_values: list[str] = []
+
+
+def _visitor_scenario_payload(body: VisitorScenarioBody) -> dict[str, Any]:
+    from visa_agent.rules.visitor_pack import AnnotationPair, run_visitor_scenario
+
+    # Keep parallel-list order and duplicate values (do not set()-dedupe).
+    result = run_visitor_scenario(
+        scenario_id=body.scenario_id,
+        classifications=list(body.classifications),
+        annotations=[
+            AnnotationPair(key=a.key, value=a.value) for a in body.annotations
+        ],
+        annotation_keys=list(body.annotation_keys),
+        annotation_values=list(body.annotation_values),
+    )
+    return {
+        "scenario_id": result.scenario_id,
+        "title": result.title,
+        "transfer_human_required": result.transfer_human_required,
+        "transfer_polarity": result.transfer_polarity,
+        "student_funds_rejected": result.student_funds_rejected,
+        "student_funds_hits": list(result.student_funds_hits),
+        "notes": list(result.notes),
+        "pack_hint": {
+            "pack_id": "standard_visitor",
+            "pack_version_for_s3_gates": 2,
+            "note": "Bind published v2 for formal evaluate polarity/funds gates",
+        },
+    }
+
+
+@app.get("/visitor-scenarios")
+def api_list_visitor_scenarios() -> dict[str, Any]:
+    """W06-V canned scenario ids for demo / TL acceptance."""
+    from visa_agent.rules.visitor_pack import SCENARIO_IDS
+
+    return {
+        "success": True,
+        "data": {
+            "route": "standard_visitor",
+            "scenario_ids": list(SCENARIO_IDS),
+            "notes": (
+                "Visitor only — Student/Worker packs deferred. "
+                "Outcomes follow shared signal assessment (not scenario-id hardcoding). "
+                "Formal evaluate S3 gates require published standard_visitor v2."
+            ),
+        },
+    }
+
+
+@app.post("/visitor-scenarios")
+def api_post_visitor_scenarios(body: VisitorScenarioBody) -> dict[str, Any]:
+    """Canonical run endpoint (contract)."""
+    return {"success": True, "data": _visitor_scenario_payload(body)}
+
+
+@app.post("/visitor-scenarios/run")
+def api_run_visitor_scenario(body: VisitorScenarioBody) -> dict[str, Any]:
+    """Alias of POST /visitor-scenarios."""
+    return {"success": True, "data": _visitor_scenario_payload(body)}
+
+
 @app.post("/cases/{case_id}/requirements/evaluate")
 def api_evaluate_requirements(case_id: str) -> dict[str, Any]:
     settings = get_settings()
@@ -846,6 +925,73 @@ def api_list_drafts(case_id: str) -> dict[str, Any]:
         case_id=case_id,
     )
     return {"success": True, "data": [_draft_payload(d) for d in drafts]}
+
+
+@app.get("/cases/{case_id}/draft/groundedness")
+def api_draft_groundedness(case_id: str) -> dict[str, Any]:
+    """W07 diagnostic bound to generation-time context; marks stale drafts."""
+    import json as _json
+
+    settings = get_settings()
+    try:
+        case = get_case(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    loaded = load_latest_draft_audit(
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+        case_id=case_id,
+    )
+    if loaded is None:
+        report = groundedness_report(
+            context=None,
+            facts=[],
+            has_draft=False,
+            current_case_version=case.case_version,
+        )
+        return {
+            "success": True,
+            "data": {
+                "case_id": case_id,
+                "model_call_id": None,
+                "report": report,
+            },
+        }
+    draft, audit = loaded
+    synthetic_payload: dict[str, Any] | None = None
+    messages = audit.get("messages") if isinstance(audit, dict) else None
+    if isinstance(messages, list) and len(messages) >= 2:
+        try:
+            user_blob = _json.loads(messages[1].get("content") or "{}")
+            if isinstance(user_blob, dict):
+                raw = user_blob.get("synthetic_context")
+                if isinstance(raw, dict):
+                    synthetic_payload = raw
+        except (_json.JSONDecodeError, TypeError, AttributeError):
+            synthetic_payload = None
+    context = context_from_stored_payload(synthetic_payload=synthetic_payload)
+    report = groundedness_report(
+        context=context,
+        facts=list(draft.candidate_facts),
+        draft_text=draft.draft_text,
+        actions=list(draft.suggested_actions),
+        draft_case_version=draft.case_version,
+        current_case_version=case.case_version,
+        has_draft=True,
+        generation_context_missing=context is None,
+    )
+    return {
+        "success": True,
+        "data": {
+            "case_id": case_id,
+            "model_call_id": draft.model_call_id,
+            "report": report,
+        },
+    }
 
 
 @app.post("/internal/email/poll")

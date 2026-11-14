@@ -27,16 +27,17 @@ _MODEL_ALLOWED_FACT_STATUSES = frozenset(
 )
 
 _SYSTEM_PROMPT = """You are a UK Standard Visitor visa email assistant drafting helper.
-You MUST only use facts present in the provided synthetic_context JSON.
-Never invent passport numbers, bank balances, or real personal data.
-Never approve, send email, or change case status.
-candidate_facts[].status MUST be one of: pending_extraction, customer_stated, unknown.
-Respond with a single JSON object only:
+Return ONLY this JSON object (no other keys, no markdown):
 {
-  "draft_text": "email body draft in the customer's language",
+  "draft_text": "short non-assertive note",
   "candidate_facts": [{"key": "...", "value": "...", "status": "customer_stated"}],
   "suggested_actions": ["human-readable next step", ...]
 }
+Rules:
+- candidate_facts[].key/value MUST copy fields from synthetic_context only.
+- candidate_facts[].status MUST be one of: pending_extraction, customer_stated, unknown.
+- NEVER claim approval, grant, send, email-out, or publish (past or completed).
+- draft_text/suggested_actions must not invent places, companions, employers, or amounts.
 """
 
 
@@ -89,7 +90,7 @@ def build_synthetic_context(case: CaseRecord) -> SyntheticCaseContext:
         },
     ]
     note = (
-        "All facts below are synthetic demo content for S1.4. "
+        "All facts below are synthetic demo content for S3 model gateway. "
         "Do not treat them as real customer PII."
     )
     return SyntheticCaseContext(
@@ -240,6 +241,16 @@ def generate_case_draft(
             message="model content must be a string",
         )
     draft_text, facts, actions = _normalize_output(content)
+    from visa_agent.ai_capabilities.gateway import gate_model_output
+
+    # Validate raw+structured output first; persist only allowed fields (no raw claim text).
+    draft_text, actions, safe_response = gate_model_output(
+        context=context,
+        draft_text=draft_text,
+        facts=facts,
+        actions=actions,
+        raw_text=content,
+    )
     model_call_id = uuid.uuid4().hex
     # Local audit keeps real identity; messages sent to the model stay synthetic-only.
     audit_blob = {
@@ -250,6 +261,7 @@ def generate_case_draft(
         },
         "messages": messages,
         "provider_id": provider.get("id"),
+        "model_raw_discarded": True,
     }
     with psycopg.connect(settings.database_url) as conn:
         conn.execute(
@@ -272,7 +284,7 @@ def generate_case_draft(
                 settings.siliconflow_model,
                 digest,
                 json.dumps(audit_blob, ensure_ascii=False),
-                content,
+                safe_response,
                 draft_text,
                 json.dumps(facts, ensure_ascii=False),
                 json.dumps(actions, ensure_ascii=False),
@@ -327,3 +339,40 @@ def list_case_drafts(
             )
         )
     return results
+
+
+def load_latest_draft_audit(
+    *,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+) -> tuple[DraftResult, dict[str, Any]] | None:
+    """Latest draft plus request_json audit (includes generation synthetic_context)."""
+    with psycopg.connect(database_url) as conn:
+        row = conn.execute(
+            """
+            SELECT id, case_id, case_version, model, draft_text,
+                   candidate_facts, suggested_actions, prompt_digest, request_json
+            FROM model_calls
+            WHERE tenant_id = %s AND case_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (tenant_id, case_id),
+        ).fetchone()
+    if row is None:
+        return None
+    facts = row[5] if isinstance(row[5], list) else json.loads(row[5] or "[]")
+    actions = row[6] if isinstance(row[6], list) else json.loads(row[6] or "[]")
+    audit = row[8] if isinstance(row[8], dict) else json.loads(row[8] or "{}")
+    draft = DraftResult(
+        model_call_id=row[0],
+        case_id=row[1],
+        case_version=row[2],
+        model=row[3],
+        draft_text=row[4] or "",
+        candidate_facts=tuple(facts),
+        suggested_actions=tuple(str(a) for a in actions),
+        prompt_digest=row[7],
+    )
+    return draft, audit
