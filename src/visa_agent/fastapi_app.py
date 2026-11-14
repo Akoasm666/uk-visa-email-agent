@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import os
 from typing import Any
 from urllib.parse import parse_qs, quote
 
@@ -9,13 +11,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-import base64
-
 from visa_agent.ai_capabilities import generate_case_draft, list_case_drafts
 from visa_agent.case_service import (
     attribute_inbound_to_case,
     create_case,
     get_case,
+    get_case_review_page,
+    get_review_board,
     list_cases,
     record_customer_confirmation,
     record_delivery_receipt,
@@ -24,8 +26,6 @@ from visa_agent.case_service import (
     set_takeover,
 )
 from visa_agent.case_service.service import bump_case_version
-import os
-
 from visa_agent.config import Settings, get_settings
 from visa_agent.domain.enums import CaseStatus, ErrorCode
 from visa_agent.domain.errors import DomainError
@@ -59,7 +59,7 @@ from visa_agent.storage.migrate import apply_migrations
 from visa_agent.workbench.pages import render_detail, render_list
 from visa_agent.workflow.transitions import apply_transition, list_allowed_targets
 
-app = FastAPI(title="visa-email-agent", version="0.6.0")
+app = FastAPI(title="visa-email-agent", version="0.7.0")
 
 
 def bootstrap(settings: Settings | None = None) -> Settings:
@@ -268,7 +268,7 @@ def root() -> dict[str, Any]:
         "success": True,
         "data": {
             "service": "visa-email-agent",
-            "stage": "S2.2",
+            "stage": "S2.3",
             "workbench": "/workbench",
             "docs": "/health",
         },
@@ -483,6 +483,55 @@ def api_review(case_id: str, body: ReviewBody) -> dict[str, Any]:
     except DomainError as exc:
         raise _domain_http(exc) from exc
     return {"success": True, "data": _case_payload(case)}
+
+
+@app.get("/cases/{case_id}/review-board")
+def api_review_board(case_id: str) -> dict[str, Any]:
+    """Confirmations + final reviews with stale (non-current version) marked."""
+    settings = get_settings()
+    try:
+        board = get_review_board(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {
+        "success": True,
+        "data": {
+            "case_id": board.case_id,
+            "case_version": board.case_version,
+            "customer_confirmation_effective": board.customer_confirmation_effective,
+            "final_approval_effective": board.final_approval_effective,
+            "current_final_decision": board.current_final_decision,
+            "confirmations": [
+                {
+                    "id": c.id,
+                    "case_version": c.case_version,
+                    "note": c.note,
+                    "created_at": c.created_at,
+                    "effective": c.effective,
+                    "stale": not c.effective,
+                }
+                for c in board.confirmations
+            ],
+            "reviews": [
+                {
+                    "id": r.id,
+                    "case_version": r.case_version,
+                    "decision": r.decision,
+                    "note": r.note,
+                    "created_at": r.created_at,
+                    "decision_seq": r.decision_seq,
+                    "effective": r.effective,
+                    "superseded": r.superseded,
+                    "stale": (not r.effective) and (not r.superseded),
+                }
+                for r in board.reviews
+            ],
+        },
+    }
 
 
 @app.post("/cases/{case_id}/attribute-inbound")
@@ -887,7 +936,7 @@ async def workbench_create(request: Request) -> RedirectResponse:
 def workbench_detail(case_id: str, request: Request) -> HTMLResponse:
     settings = get_settings()
     try:
-        case = get_case(
+        case, board = get_case_review_page(
             database_url=settings.database_url,
             tenant_id=settings.tenant_id,
             case_id=case_id,
@@ -918,6 +967,7 @@ def workbench_detail(case_id: str, request: Request) -> HTMLResponse:
             message=msg,
             drafts=drafts,
             evidence_items=evidence_items,
+            review_board=board,
         )
     )
 

@@ -32,6 +32,43 @@ class CaseRecord:
     closure_seq: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class CustomerConfirmationRecord:
+    id: str
+    case_id: str
+    case_version: int
+    note: str
+    created_at: str
+    effective: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FinalReviewRecord:
+    id: str
+    case_id: str
+    case_version: int
+    decision: str
+    note: str
+    created_at: str
+    decision_seq: int
+    effective: bool
+    superseded: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewBoardSnapshot:
+    """Current-version gate status + history with stale approvals marked."""
+
+    case_id: str
+    case_version: int
+    customer_confirmation_effective: bool
+    final_approval_effective: bool
+    # Latest decision on the snapshot version: "approve" | "reject" | None.
+    current_final_decision: str | None
+    confirmations: tuple[CustomerConfirmationRecord, ...]
+    reviews: tuple[FinalReviewRecord, ...]
+
+
 def _parse_status(value: str | None) -> CaseStatus | None:
     if value is None:
         return None
@@ -191,9 +228,10 @@ def build_transition_context(
         ).fetchone()
         review = c.execute(
             """
-            SELECT case_version FROM case_final_reviews
+            SELECT case_version, decision FROM case_final_reviews
             WHERE tenant_id = %s AND case_id = %s AND case_version = %s
-              AND decision = 'approve'
+            ORDER BY decision_seq DESC
+            LIMIT 1
             """,
             (case.tenant_id, case.id, case.case_version),
         ).fetchone()
@@ -237,10 +275,13 @@ def build_transition_context(
             ):
                 receipt = (delivery_ok[0],)
 
+        approval_version = None
+        if review is not None and review[1] == "approve":
+            approval_version = review[0]
         return TransitionContext(
             case_version=case.case_version,
             customer_confirmation_case_version=conf[0] if conf else None,
-            final_review_approval_case_version=review[0] if review else None,
+            final_review_approval_case_version=approval_version,
             reopen_authorized=reopen is not None,
             resume_status=case.resume_status,
             delivery_id=case.current_delivery_id,
@@ -313,6 +354,194 @@ def record_customer_confirmation(
             )
 
 
+def _confirmations_from_rows(
+    rows: list[tuple], *, case_version: int
+) -> list[CustomerConfirmationRecord]:
+    return [
+        CustomerConfirmationRecord(
+            id=r[0],
+            case_id=r[1],
+            case_version=r[2],
+            note=r[3] or "",
+            created_at=r[4].isoformat() if r[4] is not None else "",
+            effective=int(r[2]) == case_version,
+        )
+        for r in rows
+    ]
+
+
+def _reviews_from_rows(
+    rows: list[tuple], *, case_version: int
+) -> list[FinalReviewRecord]:
+    """Mark only the highest decision_seq for the snapshot version as effective.
+
+    ``rows`` must already be ordered by decision_seq DESC.
+    Row shape: id, case_id, case_version, decision, note, created_at, decision_seq
+    """
+    latest_current_id: str | None = None
+    for r in rows:
+        if int(r[2]) == case_version:
+            latest_current_id = r[0]
+            break
+    out: list[FinalReviewRecord] = []
+    for r in rows:
+        ver = int(r[2])
+        is_current_ver = ver == case_version
+        is_latest = latest_current_id is not None and r[0] == latest_current_id
+        out.append(
+            FinalReviewRecord(
+                id=r[0],
+                case_id=r[1],
+                case_version=ver,
+                decision=r[3],
+                note=r[4] or "",
+                created_at=r[5].isoformat() if r[5] is not None else "",
+                decision_seq=int(r[6] or 0),
+                effective=is_current_ver and is_latest,
+                superseded=is_current_ver and not is_latest,
+            )
+        )
+    return out
+
+
+def _load_review_histories(
+    conn: psycopg.Connection,
+    *,
+    tenant_id: str,
+    case_id: str,
+    case_version: int,
+) -> tuple[list[CustomerConfirmationRecord], list[FinalReviewRecord]]:
+    """Read histories visible at/before the snapshot case_version."""
+    conf_rows = conn.execute(
+        """
+        SELECT id, case_id, case_version, note, created_at
+        FROM case_customer_confirmations
+        WHERE tenant_id = %s AND case_id = %s
+          AND case_version <= %s
+        ORDER BY case_version DESC, created_at DESC
+        """,
+        (tenant_id, case_id, case_version),
+    ).fetchall()
+    review_rows = conn.execute(
+        """
+        SELECT id, case_id, case_version, decision, note, created_at, decision_seq
+        FROM case_final_reviews
+        WHERE tenant_id = %s AND case_id = %s
+          AND case_version <= %s
+        ORDER BY decision_seq DESC, created_at DESC
+        """,
+        (tenant_id, case_id, case_version),
+    ).fetchall()
+    return (
+        _confirmations_from_rows(list(conf_rows), case_version=case_version),
+        _reviews_from_rows(list(review_rows), case_version=case_version),
+    )
+
+
+def _repeatable_read_conn(database_url: str) -> psycopg.Connection:
+    conn = psycopg.connect(database_url)
+    conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+    return conn
+
+
+def list_customer_confirmations(
+    *,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+) -> list[CustomerConfirmationRecord]:
+    with _repeatable_read_conn(database_url) as conn:
+        with conn.transaction():
+            case = get_case(
+                database_url=database_url,
+                tenant_id=tenant_id,
+                case_id=case_id,
+                conn=conn,
+            )
+            confs, _reviews = _load_review_histories(
+                conn,
+                tenant_id=tenant_id,
+                case_id=case_id,
+                case_version=case.case_version,
+            )
+    return confs
+
+
+def list_final_reviews(
+    *,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+) -> list[FinalReviewRecord]:
+    with _repeatable_read_conn(database_url) as conn:
+        with conn.transaction():
+            case = get_case(
+                database_url=database_url,
+                tenant_id=tenant_id,
+                case_id=case_id,
+                conn=conn,
+            )
+            _confs, reviews = _load_review_histories(
+                conn,
+                tenant_id=tenant_id,
+                case_id=case_id,
+                case_version=case.case_version,
+            )
+    return reviews
+
+
+def get_case_review_page(
+    *,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+) -> tuple[CaseRecord, ReviewBoardSnapshot]:
+    """Case header + histories from one REPEATABLE READ snapshot."""
+    with _repeatable_read_conn(database_url) as conn:
+        with conn.transaction():
+            case = get_case(
+                database_url=database_url,
+                tenant_id=tenant_id,
+                case_id=case_id,
+                conn=conn,
+            )
+            confirmations, reviews = _load_review_histories(
+                conn,
+                tenant_id=tenant_id,
+                case_id=case_id,
+                case_version=case.case_version,
+            )
+    conf_ok = any(c.effective for c in confirmations)
+    current_decision: str | None = None
+    for r in reviews:
+        if r.effective:
+            current_decision = r.decision
+            break
+    board = ReviewBoardSnapshot(
+        case_id=case.id,
+        case_version=case.case_version,
+        customer_confirmation_effective=conf_ok,
+        final_approval_effective=current_decision == "approve",
+        current_final_decision=current_decision,
+        confirmations=tuple(confirmations),
+        reviews=tuple(reviews),
+    )
+    return case, board
+
+
+def get_review_board(
+    *,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+) -> ReviewBoardSnapshot:
+    """Load confirmation/review history against one case version snapshot."""
+    _case, board = get_case_review_page(
+        database_url=database_url, tenant_id=tenant_id, case_id=case_id
+    )
+    return board
+
+
 def record_final_review(
     *,
     database_url: str,
@@ -337,15 +566,25 @@ def record_final_review(
                 for_update=True,
             )
             _require_version(case, expected_case_version, required=True)
+            # Monotonic seq under the case lock — not PostgreSQL txn-start NOW().
+            seq_row = conn.execute(
+                """
+                UPDATE cases
+                SET final_review_seq = final_review_seq + 1,
+                    updated_at = NOW()
+                WHERE tenant_id = %s AND id = %s
+                RETURNING final_review_seq
+                """,
+                (tenant_id, case_id),
+            ).fetchone()
+            assert seq_row is not None
+            decision_seq = int(seq_row[0])
             conn.execute(
                 """
                 INSERT INTO case_final_reviews (
-                    id, tenant_id, case_id, case_version, decision, note
-                ) VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (tenant_id, case_id, case_version) DO UPDATE
-                SET decision = EXCLUDED.decision,
-                    note = EXCLUDED.note,
-                    created_at = NOW()
+                    id, tenant_id, case_id, case_version, decision, note,
+                    decision_seq
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     uuid.uuid4().hex,
@@ -354,6 +593,7 @@ def record_final_review(
                     case.case_version,
                     decision,
                     note,
+                    decision_seq,
                 ),
             )
 

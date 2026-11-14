@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS cases (
 );
 
 ALTER TABLE cases ADD COLUMN IF NOT EXISTS closure_seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE cases ADD COLUMN IF NOT EXISTS final_review_seq INTEGER NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_cases_tenant_updated
     ON cases (tenant_id, updated_at DESC);
@@ -116,9 +117,53 @@ CREATE TABLE IF NOT EXISTS case_final_reviews (
     case_version INTEGER NOT NULL,
     decision TEXT NOT NULL CHECK (decision IN ('approve', 'reject')),
     note TEXT NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (tenant_id, case_id, case_version)
+    decision_seq INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- S2.3: keep every decision; gate uses lock-allocated decision_seq (not txn start time).
+ALTER TABLE case_final_reviews
+    DROP CONSTRAINT IF EXISTS case_final_reviews_tenant_id_case_id_case_version_key;
+
+ALTER TABLE case_final_reviews
+    ADD COLUMN IF NOT EXISTS decision_seq INTEGER;
+
+-- Backfill only rows missing decision_seq (legacy DBs before S2.3 seq).
+UPDATE case_final_reviews AS r
+SET decision_seq = s.seq
+FROM (
+    SELECT id,
+           ROW_NUMBER() OVER (
+               PARTITION BY tenant_id, case_id
+               ORDER BY created_at ASC, id ASC
+           ) AS seq
+    FROM case_final_reviews
+    WHERE decision_seq IS NULL
+) AS s
+WHERE r.id = s.id
+  AND r.decision_seq IS NULL;
+
+UPDATE cases AS c
+SET final_review_seq = GREATEST(
+    c.final_review_seq,
+    COALESCE((
+        SELECT MAX(fr.decision_seq)
+        FROM case_final_reviews fr
+        WHERE fr.tenant_id = c.tenant_id AND fr.case_id = c.id
+    ), 0)
+);
+
+ALTER TABLE case_final_reviews
+    ALTER COLUMN decision_seq SET DEFAULT 0;
+
+-- Remaining NULLs (no rows matched) → 0 before NOT NULL.
+UPDATE case_final_reviews SET decision_seq = 0 WHERE decision_seq IS NULL;
+
+ALTER TABLE case_final_reviews
+    ALTER COLUMN decision_seq SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_case_final_reviews_case_seq
+    ON case_final_reviews (tenant_id, case_id, decision_seq DESC);
 
 CREATE TABLE IF NOT EXISTS case_reopen_grants (
     id TEXT PRIMARY KEY,

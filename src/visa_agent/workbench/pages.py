@@ -139,6 +139,110 @@ def _render_evidence_section(
 </section>"""
 
 
+def _badge(
+    effective: bool,
+    *,
+    approve: bool | None = None,
+    superseded: bool = False,
+) -> str:
+    if superseded:
+        return (
+            '<span style="color:#666;font-weight:600">'
+            "已被同版本后续决定取代</span>"
+        )
+    if not effective:
+        return (
+            '<span style="color:#a33;font-weight:600">'
+            "已失效（非当前版本）</span>"
+        )
+    if approve is False:
+        return (
+            '<span style="color:#8a5a00;font-weight:600">'
+            "当前版本 · 驳回</span>"
+        )
+    return (
+        '<span style="color:#0a7a3e;font-weight:600">'
+        "当前有效</span>"
+    )
+
+
+def _render_review_board(
+    case: CaseRecord, board: object | None
+) -> str:
+    if board is None:
+        return ""
+    # Always use board snapshot version — same source as gates/history.
+    snap_ver = int(getattr(board, "case_version", case.case_version))
+    conf_gate = (
+        "已满足"
+        if getattr(board, "customer_confirmation_effective", False)
+        else "缺失 / 已失效"
+    )
+    if getattr(board, "final_approval_effective", False):
+        appr_gate = "已满足"
+    elif getattr(board, "current_final_decision", None) == "reject":
+        appr_gate = "已驳回"
+    else:
+        appr_gate = "缺失 / 已失效"
+    conf_rows = []
+    for c in getattr(board, "confirmations", ()) or ():
+        conf_rows.append(
+            "<tr>"
+            f"<td>v{int(getattr(c, 'case_version', 0))}</td>"
+            f"<td>{_badge(bool(getattr(c, 'effective', False)))}</td>"
+            f"<td>{escape(getattr(c, 'note', '') or '—')}</td>"
+            f"<td><code>{escape((getattr(c, 'created_at', '') or '')[:19])}</code></td>"
+            "</tr>"
+        )
+    review_rows = []
+    for r in getattr(board, "reviews", ()) or ():
+        decision = getattr(r, "decision", "") or ""
+        effective = bool(getattr(r, "effective", False))
+        superseded = bool(getattr(r, "superseded", False))
+        badge = _badge(
+            effective,
+            approve=(decision == "approve") if effective else None,
+            superseded=superseded,
+        )
+        review_rows.append(
+            "<tr>"
+            f"<td>v{int(getattr(r, 'case_version', 0))}</td>"
+            f"<td>{escape(decision)}</td>"
+            f"<td>{badge}</td>"
+            f"<td>{escape(getattr(r, 'note', '') or '—')}</td>"
+            f"<td><code>{escape((getattr(r, 'created_at', '') or '')[:19])}</code></td>"
+            "</tr>"
+        )
+    conf_body = (
+        "".join(conf_rows)
+        if conf_rows
+        else "<tr><td colspan='4'>（尚无客户确认）</td></tr>"
+    )
+    review_body = (
+        "".join(review_rows)
+        if review_rows
+        else "<tr><td colspan='5'>（尚无最终审批）</td></tr>"
+    )
+    return f"""<section>
+<strong>审核台 · 确认与审批（旧版失效可见）</strong>
+<p style="margin:.5rem 0">当前案件 <code>v{snap_ver}</code> 门控：
+客户确认 <strong>{escape(conf_gate)}</strong> ·
+最终审批 <strong>{escape(appr_gate)}</strong>
+</p>
+<p style="color:#666;font-size:.9rem;margin:.25rem 0 0.75rem">
+仅绑定当前 <code>case_version</code> 的最新决定有效；版本推进后旧确认/审批自动失效且仍可在此追溯。
+</p>
+<p style="margin:.5rem 0 .25rem"><em>客户确认历史</em></p>
+<table><thead><tr>
+<th>绑定版本</th><th>状态</th><th>备注</th><th>时间</th>
+</tr></thead><tbody>{conf_body}</tbody></table>
+<p style="margin:1rem 0 .25rem"><em>最终审批历史</em></p>
+<table><thead><tr>
+<th>绑定版本</th><th>决定</th><th>状态</th><th>备注</th><th>时间</th>
+</tr></thead><tbody>{review_body}</tbody></table>
+</section>"""
+
+
 def render_detail(
     case: CaseRecord,
     *,
@@ -146,6 +250,7 @@ def render_detail(
     message: str | None = None,
     drafts: list[object] | None = None,
     evidence_items: list[object] | None = None,
+    review_board: object | None = None,
 ) -> str:
     opts = "\n".join(
         f'<option value="{escape(s.value)}">{escape(s.value)}</option>'
@@ -216,6 +321,7 @@ button,input,select{{font:inherit;padding:.35rem .6rem}}
 </form>
 </section>
 {_render_evidence_section(case, evidence_items or [])}
+{_render_review_board(case, review_board)}
 <section>
 <strong>状态迁移</strong>
 <form method="post" action="/workbench/cases/{escape(case.id)}/transition">
