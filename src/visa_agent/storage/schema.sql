@@ -261,7 +261,8 @@ CREATE TABLE IF NOT EXISTS model_calls (
 CREATE INDEX IF NOT EXISTS idx_model_calls_case
     ON model_calls (tenant_id, case_id, created_at DESC);
 
--- S2.1 document pipeline: isolated originals + human annotations (no OCR confirm)
+-- S2.1 document pipeline: isolated originals + human annotations
+-- OCR (when run) stores derived text only — never mutates original bytes / auto-confirm.
 CREATE TABLE IF NOT EXISTS case_evidence (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
@@ -300,6 +301,28 @@ CREATE TABLE IF NOT EXISTS evidence_annotations (
 
 CREATE INDEX IF NOT EXISTS idx_evidence_annotations_evidence
     ON evidence_annotations (tenant_id, evidence_id, created_at DESC);
+
+-- Derived OCR artifacts (immutable originals stay byte-intact)
+CREATE TABLE IF NOT EXISTS evidence_ocr_results (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    evidence_id TEXT NOT NULL REFERENCES case_evidence(id),
+    case_id TEXT NOT NULL REFERENCES cases(id),
+    case_version INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN ('pending', 'completed', 'failed', 'unsupported')),
+    extracted_text TEXT NOT NULL DEFAULT '',
+    source_content_sha256 TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_evidence_ocr_evidence
+    ON evidence_ocr_results (tenant_id, evidence_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_evidence_ocr_case
+    ON evidence_ocr_results (tenant_id, case_id, created_at DESC);
 
 -- S2.2 rules container (W05 minimal): versioned packs, human publish only
 CREATE TABLE IF NOT EXISTS rule_packs (
@@ -363,3 +386,48 @@ CREATE TABLE IF NOT EXISTS delivery_packages (
 
 CREATE INDEX IF NOT EXISTS idx_delivery_packages_case
     ON delivery_packages (tenant_id, case_id, created_at DESC);
+
+-- Glossary OpenQuestion: remediation /补件 lifecycle (auto open/close)
+CREATE TABLE IF NOT EXISTS open_questions (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    case_id TEXT NOT NULL REFERENCES cases(id),
+    case_version INTEGER NOT NULL DEFAULT 1,
+    requirement_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'waiting_customer'
+        CHECK (status IN (
+            'open', 'waiting_customer', 'closed', 'escalated_human'
+        )),
+    severity TEXT NOT NULL DEFAULT 'simple_auto'
+        CHECK (severity IN ('simple_auto', 'complex_human')),
+    reason_code TEXT NOT NULL DEFAULT '',
+    reason_detail TEXT NOT NULL DEFAULT '',
+    evidence_id TEXT,
+    closed_by_evidence_id TEXT,
+    source_email_event_id TEXT,
+    outbound_email_event_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    closed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_open_questions_case
+    ON open_questions (tenant_id, case_id, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_open_questions_active_req
+    ON open_questions (tenant_id, case_id, requirement_key)
+    WHERE status IN ('open', 'waiting_customer', 'escalated_human');
+
+-- Dynamic outbound allowlist (unioned with EMAIL_OUTBOUND_ALLOWLIST in .env).
+-- Case create auto-inserts customer_email so opening/reply mail can send.
+CREATE TABLE IF NOT EXISTS outbound_allowlist_entries (
+    tenant_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'case_create',
+    case_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, email)
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbound_allowlist_tenant
+    ON outbound_allowlist_entries (tenant_id, created_at DESC);

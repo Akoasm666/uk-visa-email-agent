@@ -768,5 +768,41 @@ class EvidencePipelineTests(unittest.TestCase):
         self.assertEqual(stale.status_code, 409)
 
         page = self.client.get(f"/workbench/cases/{case_id}")
-        self.assertIn("证据原件", page.text)
+        self.assertIn("材料清单", page.text)
         self.assertIn("note.txt", page.text)
+        self.assertIn("查看", page.text)
+        self.assertIn("下载", page.text)
+
+    def test_workbench_multipart_upload_and_view(self) -> None:
+        created = self.client.post(
+            "/cases", json={"title": "wb-upload", "customer_email": "u@y.com"}
+        )
+        case_id = created.json()["data"]["case_id"]
+        case = self.client.get(f"/cases/{case_id}").json()["data"]
+        version = case["case_version"]
+        payload = b"real local passport bytes for demo"
+        resp = self.client.post(
+            f"/workbench/cases/{case_id}/evidence",
+            data={
+                "expected_case_version": str(version),
+                "classification": "passport",
+            },
+            files={
+                "file": ("passport.pdf", payload, "application/pdf"),
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+        items = self.client.get(f"/cases/{case_id}/evidence").json()["data"]
+        self.assertTrue(items)
+        evidence_id = items[0]["evidence_id"]
+        view = self.client.get(
+            f"/workbench/cases/{case_id}/evidence/{evidence_id}/view"
+        )
+        self.assertEqual(view.status_code, 200)
+        self.assertIn("passport.pdf", view.text)
+        raw = self.client.get(
+            f"/workbench/cases/{case_id}/evidence/{evidence_id}/file"
+        )
+        self.assertEqual(raw.status_code, 200)
+        self.assertEqual(raw.content, payload)

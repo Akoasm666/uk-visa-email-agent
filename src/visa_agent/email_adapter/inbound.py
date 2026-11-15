@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import uuid
@@ -14,6 +15,13 @@ from visa_agent.storage.files import LocalFileStore
 
 
 @dataclass(frozen=True, slots=True)
+class InboundAttachment:
+    filename: str
+    content_type: str
+    data: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class InboundEmail:
     from_addr: str
     to_addrs: tuple[str, ...]
@@ -22,6 +30,7 @@ class InboundEmail:
     rfc_message_id: str | None = None
     provider_message_id: str | None = None
     claimed_case_id: str | None = None
+    attachments: tuple[InboundAttachment, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +59,47 @@ def build_dedupe_key(mail: InboundEmail) -> str:
     return f"hash:{digest}"
 
 
+def _attachments_payload(
+    attachments: tuple[InboundAttachment, ...] | list[InboundAttachment],
+) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for att in attachments or ():
+        out.append(
+            {
+                "filename": att.filename,
+                "content_type": att.content_type,
+                "content_base64": base64.b64encode(att.data).decode("ascii"),
+            }
+        )
+    return out
+
+
+def attachments_from_payload(raw: object) -> tuple[InboundAttachment, ...]:
+    if not isinstance(raw, list):
+        return ()
+    items: list[InboundAttachment] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        b64 = row.get("content_base64") or ""
+        try:
+            data = base64.b64decode(b64, validate=False)
+        except Exception:  # noqa: BLE001
+            continue
+        if not data:
+            continue
+        items.append(
+            InboundAttachment(
+                filename=str(row.get("filename") or "attachment.bin"),
+                content_type=str(
+                    row.get("content_type") or "application/octet-stream"
+                ),
+                data=data,
+            )
+        )
+    return tuple(items)
+
+
 def _raw_payload_from_mail(mail: InboundEmail) -> bytes:
     return json.dumps(
         {
@@ -60,6 +110,7 @@ def _raw_payload_from_mail(mail: InboundEmail) -> bytes:
             "rfc_message_id": mail.rfc_message_id,
             "provider_message_id": mail.provider_message_id,
             "claimed_case_id": mail.claimed_case_id,
+            "attachments": _attachments_payload(mail.attachments),
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -74,6 +125,7 @@ def _raw_payload_from_row(
     rfc_message_id: str | None,
     provider_message_id: str | None,
     claimed_case_id: str | None,
+    attachments: object = None,
 ) -> bytes:
     if isinstance(to_addrs, str):
         to_addrs = json.loads(to_addrs)
@@ -86,6 +138,7 @@ def _raw_payload_from_row(
             "rfc_message_id": rfc_message_id,
             "provider_message_id": provider_message_id,
             "claimed_case_id": claimed_case_id,
+            "attachments": attachments if isinstance(attachments, list) else [],
         },
         ensure_ascii=False,
     ).encode("utf-8")

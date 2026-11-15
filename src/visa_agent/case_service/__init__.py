@@ -1,3 +1,23 @@
+from visa_agent.case_service.inbound_agent import (
+    InboundProcessResult,
+    process_customer_inbound,
+    process_inbound_after_attribution,
+)
+from visa_agent.case_service.remediation import (
+    AdvisorAlert,
+    OpenQuestion,
+    acknowledge_advisor_question,
+    close_remediation,
+    list_advisor_alerts,
+    list_open_questions,
+    open_remediation,
+)
+from visa_agent.case_service.outreach import (
+    OpeningOutreachResult,
+    require_customer_email,
+    send_opening_outreach,
+    try_auto_attribute_inbound_by_customer_email,
+)
 from visa_agent.case_service.service import (
     CaseRecord,
     CustomerConfirmationRecord,
@@ -17,6 +37,7 @@ from visa_agent.case_service.service import (
     record_delivery_receipt,
     record_final_review,
     record_reopen_grant,
+    set_case_route,
     set_takeover,
 )
 
@@ -24,20 +45,35 @@ __all__ = [
     "CaseRecord",
     "CustomerConfirmationRecord",
     "FinalReviewRecord",
+    "AdvisorAlert",
+    "InboundProcessResult",
+    "OpeningOutreachResult",
+    "OpenQuestion",
     "ReviewBoardSnapshot",
+    "acknowledge_advisor_question",
     "attribute_inbound_to_case",
     "build_transition_context",
+    "close_remediation",
     "create_case",
     "get_case",
     "get_case_review_page",
     "get_review_board",
+    "list_advisor_alerts",
     "list_cases",
     "list_customer_confirmations",
     "list_final_reviews",
+    "list_open_questions",
     "mark_inbound_processed",
+    "open_remediation",
+    "process_customer_inbound",
+    "process_inbound_after_attribution",
     "record_customer_confirmation",
     "record_delivery_receipt",
     "record_final_review",
     "record_reopen_grant",
+    "require_customer_email",
+    "send_opening_outreach",
+    "set_case_route",
     "set_takeover",
+    "try_auto_attribute_inbound_by_customer_email",
 ]

@@ -15,6 +15,7 @@ from visa_agent.delivery.service import get_package, verify_package_bytes
 from visa_agent.domain.enums import CaseStatus, DeliveryKind, ErrorCode, OutboundMessageKind
 from visa_agent.domain.errors import DomainError
 from visa_agent.domain.models import FinalPackageApproval, OutboundGateInput, evaluate_outbound_gate
+from visa_agent.email_adapter.allowlist import effective_outbound_allowlist
 from visa_agent.email_adapter.errors import (
     SendPartialAcceptedError,
     SendStatusUnknownError,
@@ -285,7 +286,7 @@ def _evaluate_gates(
     gate = OutboundGateInput(
         kind=kind,
         recipient_emails=frozenset(recipients),
-        allowlist=settings.outbound_allowlist,
+        allowlist=effective_outbound_allowlist(settings),
         human_takeover=bool(case.human_takeover),  # type: ignore[attr-defined]
         human_send_approved=False,
         case_version=case_version,

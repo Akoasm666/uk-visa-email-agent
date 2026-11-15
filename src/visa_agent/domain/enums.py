@@ -42,6 +42,7 @@ class RouteCode(StrEnum):
     STANDARD_VISITOR = "standard_visitor"
     STUDENT = "student"
     SKILLED_WORKER = "skilled_worker"
+    GRADUATE = "graduate"
 
 
 class DeliveryKind(StrEnum):

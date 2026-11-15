@@ -164,6 +164,18 @@ def create_case(
             ),
         )
         conn.commit()
+    # New customer email → DB allowlist so opening/reply can send without
+    # manually editing EMAIL_OUTBOUND_ALLOWLIST in .env.
+    if customer_email:
+        from visa_agent.email_adapter.allowlist import add_outbound_allowlist_email
+
+        add_outbound_allowlist_email(
+            database_url=database_url,
+            tenant_id=tenant_id,
+            email=customer_email,
+            source="case_create",
+            case_id=case_id,
+        )
     return get_case(database_url=database_url, tenant_id=tenant_id, case_id=case_id)
 
 
@@ -200,13 +212,56 @@ def list_cases(
     database_url: str,
     tenant_id: str,
     limit: int = 50,
+    q: str | None = None,
+    status: str | None = None,
+    route: str | None = None,
+    waiting: str | None = None,
 ) -> list[CaseRecord]:
+    """List cases with optional search / status / route / waiting filters.
+
+    ``waiting``: customer | third_party | takeover | any_flag
+    """
+    limit = max(1, min(int(limit or 50), 200))
+    clauses = ["tenant_id = %s"]
+    params: list = [tenant_id]
+    needle = (q or "").strip()
+    if needle:
+        clauses.append(
+            "("
+            "title ILIKE %s OR customer_email ILIKE %s OR id ILIKE %s"
+            ")"
+        )
+        like = f"%{needle}%"
+        params.extend([like, like, like])
+    st = (status or "").strip()
+    if st:
+        clauses.append("status = %s")
+        params.append(st)
+    rt = (route or "").strip()
+    if rt:
+        clauses.append("route = %s")
+        params.append(rt)
+    wait = (waiting or "").strip().lower()
+    if wait == "customer":
+        clauses.append("waiting_customer = TRUE")
+    elif wait == "third_party":
+        clauses.append("waiting_third_party = TRUE")
+    elif wait == "takeover":
+        clauses.append("human_takeover = TRUE")
+    elif wait == "any_flag":
+        clauses.append(
+            "(waiting_customer OR waiting_third_party OR human_takeover "
+            "OR system_blocked OR paused)"
+        )
+    sql = (
+        _CASE_SELECT
+        + " WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY updated_at DESC LIMIT %s"
+    )
+    params.append(limit)
     with psycopg.connect(database_url) as conn:
-        rows = conn.execute(
-            _CASE_SELECT
-            + " WHERE tenant_id = %s ORDER BY updated_at DESC LIMIT %s",
-            (tenant_id, limit),
-        ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     return [_row_to_case(r) for r in rows]
 
 
@@ -299,6 +354,67 @@ def build_transition_context(
     assert database_url is not None
     with psycopg.connect(database_url) as owned:
         return _load(owned)
+
+
+def set_case_route(
+    *,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+    route: RouteCode,
+    expected_case_version: int | None = None,
+) -> CaseRecord:
+    """Bind or change case route; clear pack binding and bump version on change.
+
+    Route changes invalidate prior confirmations/approvals and any active pack
+    so Student/Worker packs cannot silently stay bound to a Visitor case.
+    """
+    with psycopg.connect(database_url) as conn:
+        with conn.transaction():
+            case = get_case(
+                database_url=database_url,
+                tenant_id=tenant_id,
+                case_id=case_id,
+                conn=conn,
+                for_update=True,
+            )
+            _require_version(case, expected_case_version, required=True)
+            if case.route == route:
+                return case
+            # Late route changes after collect risk stale evidence checklists.
+            if case.status not in {
+                CaseStatus.LEAD,
+                CaseStatus.INTAKE_AUTHORIZATION,
+                CaseStatus.ROUTE_SCOPE_CONFIRMED,
+            }:
+                raise DomainError(
+                    code=ErrorCode.VALIDATION_ERROR,
+                    message=(
+                        "route can only be set while lead / intake / "
+                        "route_scope_confirmed"
+                    ),
+                    details=(case.status.value,),
+                )
+            bumped = bump_case_version_in_conn(
+                conn=conn,
+                database_url=database_url,
+                tenant_id=tenant_id,
+                case_id=case_id,
+                expected_case_version=case.case_version,
+                required=True,
+            )
+            conn.execute(
+                """
+                UPDATE cases
+                SET route = %s,
+                    active_pack_id = NULL,
+                    active_pack_version = NULL,
+                    updated_at = NOW()
+                WHERE tenant_id = %s AND id = %s AND case_version = %s
+                """,
+                (route.value, tenant_id, case_id, bumped.case_version),
+            )
+    return get_case(database_url=database_url, tenant_id=tenant_id, case_id=case_id)
 
 
 def set_takeover(

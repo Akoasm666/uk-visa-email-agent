@@ -10,3 +10,6 @@ data/
 .env
 .DS_Store
 .python-version
+.ui_preview/
+node_modules/
+skills/

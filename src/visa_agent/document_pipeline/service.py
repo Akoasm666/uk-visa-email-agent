@@ -1,6 +1,6 @@
 """S2.1 document pipeline: quarantine originals + human field annotations.
 
-Never modifies original bytes. OCR auto-confirm is out of scope (TL decision).
+Never modifies original bytes. OCR writes derived text only (no auto-confirm).
 Material changes bump case_version in the same transaction as the write.
 """
 
@@ -20,6 +20,7 @@ from visa_agent.case_service.service import (
     bump_case_version_in_conn,
     get_case,
 )
+from visa_agent.document_pipeline.ocr import OcrProvider, default_ocr_provider
 from visa_agent.domain.enums import ErrorCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.storage.files import LocalFileStore
@@ -90,6 +91,20 @@ class EvidenceAnnotation:
     field_key: str
     field_value: str
     note: str
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceOcrResult:
+    id: str
+    tenant_id: str
+    evidence_id: str
+    case_id: str
+    case_version: int
+    provider: str
+    status: str
+    extracted_text: str
+    source_content_sha256: str
+    detail: str
 
 
 def _ext(filename: str) -> str:
@@ -361,6 +376,43 @@ def _cleanup_orphan_evidence_file(
                 file_store.delete_file(path)
 
 
+def set_evidence_classification(
+    *,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+    evidence_id: str,
+    classification: str,
+) -> EvidenceRecord:
+    """Update checklist slot label after OCR/filename classify (no version bump)."""
+    label = (classification or "unclassified").strip() or "unclassified"
+    if label.lower() in {"fuzzy", "unclear", "unknown"}:
+        label = "unclassified"
+    with psycopg.connect(database_url) as conn:
+        row = conn.execute(
+            """
+            UPDATE case_evidence
+            SET classification = %s
+            WHERE tenant_id = %s AND case_id = %s AND id = %s
+            RETURNING id
+            """,
+            (label, tenant_id, case_id, evidence_id),
+        ).fetchone()
+        if row is None:
+            raise DomainError(
+                code=ErrorCode.NOT_FOUND,
+                message="evidence not found",
+                details=(evidence_id,),
+            )
+        conn.commit()
+    return get_evidence(
+        database_url=database_url,
+        tenant_id=tenant_id,
+        case_id=case_id,
+        evidence_id=evidence_id,
+    )
+
+
 def get_evidence(
     *,
     database_url: str,
@@ -628,3 +680,209 @@ def list_annotations(
         )
         for r in rows
     ]
+
+
+def _row_to_ocr(row: tuple) -> EvidenceOcrResult:
+    return EvidenceOcrResult(
+        id=row[0],
+        tenant_id=row[1],
+        evidence_id=row[2],
+        case_id=row[3],
+        case_version=row[4],
+        provider=row[5] or "",
+        status=row[6] or "",
+        extracted_text=row[7] or "",
+        source_content_sha256=row[8] or "",
+        detail=row[9] or "",
+    )
+
+
+def run_ocr_on_evidence(
+    *,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+    evidence_id: str,
+    file_store: LocalFileStore,
+    expected_case_version: int | None = None,
+    provider: OcrProvider | None = None,
+) -> EvidenceOcrResult:
+    """Extract derived OCR text; never mutates original quarantine bytes.
+
+    Bumps case_version so prior confirm/approve bindings become stale (material
+    derived artifact). Does not write evidence_annotations (no auto-confirm).
+    """
+    engine = provider or default_ocr_provider()
+    ocr_id = uuid.uuid4().hex
+
+    with psycopg.connect(database_url) as conn:
+        with conn.transaction():
+            case = get_case(
+                database_url=database_url,
+                tenant_id=tenant_id,
+                case_id=case_id,
+                conn=conn,
+                for_update=True,
+            )
+            _require_version(case, expected_case_version, required=True)
+            evidence = get_evidence(
+                database_url=database_url,
+                tenant_id=tenant_id,
+                case_id=case_id,
+                evidence_id=evidence_id,
+                conn=conn,
+            )
+            if evidence.quarantine_status == "rejected" or _is_hard_rejected(
+                evidence
+            ):
+                raise DomainError(
+                    code=ErrorCode.ATTACHMENT_REJECTED,
+                    message="cannot OCR rejected evidence",
+                    details=(evidence_id,),
+                )
+
+            path = file_store.path_for_file_id(evidence.file_id)
+            if not path.is_file():
+                raise DomainError(
+                    code=ErrorCode.NOT_FOUND,
+                    message="evidence original file missing on disk",
+                    details=(evidence.file_id,),
+                )
+            original_bytes = path.read_bytes()
+            live_digest = hashlib.sha256(original_bytes).hexdigest()
+            if live_digest != evidence.content_sha256:
+                raise DomainError(
+                    code=ErrorCode.SYSTEM_BLOCKED,
+                    message="evidence original bytes diverge from recorded sha256",
+                    details=(evidence.content_sha256, live_digest),
+                )
+
+            extraction = engine.extract(
+                original_bytes,
+                filename=evidence.original_filename,
+                content_type=evidence.content_type,
+            )
+            # Re-read + verify isolation: OCR must not have rewritten the file.
+            after_bytes = path.read_bytes()
+            after_digest = hashlib.sha256(after_bytes).hexdigest()
+            if after_digest != evidence.content_sha256:
+                raise DomainError(
+                    code=ErrorCode.SYSTEM_BLOCKED,
+                    message="OCR path mutated original evidence bytes",
+                    details=(evidence.file_id,),
+                )
+
+            bumped = bump_case_version_in_conn(
+                conn=conn,
+                database_url=database_url,
+                tenant_id=tenant_id,
+                case_id=case_id,
+                expected_case_version=case.case_version,
+                required=True,
+            )
+            status = extraction.status
+            if status not in {"completed", "failed", "unsupported", "pending"}:
+                status = "failed"
+            conn.execute(
+                """
+                INSERT INTO evidence_ocr_results (
+                    id, tenant_id, evidence_id, case_id, case_version,
+                    provider, status, extracted_text, source_content_sha256, detail
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    ocr_id,
+                    tenant_id,
+                    evidence_id,
+                    case_id,
+                    bumped.case_version,
+                    extraction.provider or engine.name,
+                    status,
+                    extraction.text or "",
+                    evidence.content_sha256,
+                    extraction.detail or "",
+                ),
+            )
+
+    return get_ocr_result(
+        database_url=database_url,
+        tenant_id=tenant_id,
+        case_id=case_id,
+        ocr_id=ocr_id,
+    )
+
+
+def get_ocr_result(
+    *,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+    ocr_id: str,
+) -> EvidenceOcrResult:
+    with psycopg.connect(database_url) as conn:
+        row = conn.execute(
+            """
+            SELECT id, tenant_id, evidence_id, case_id, case_version,
+                   provider, status, extracted_text, source_content_sha256, detail
+            FROM evidence_ocr_results
+            WHERE tenant_id = %s AND case_id = %s AND id = %s
+            """,
+            (tenant_id, case_id, ocr_id),
+        ).fetchone()
+    if row is None:
+        raise DomainError(
+            code=ErrorCode.NOT_FOUND,
+            message="OCR result not found",
+            details=(ocr_id,),
+        )
+    return _row_to_ocr(row)
+
+
+def list_ocr_results(
+    *,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+    evidence_id: str | None = None,
+) -> list[EvidenceOcrResult]:
+    with psycopg.connect(database_url) as conn:
+        if evidence_id:
+            rows = conn.execute(
+                """
+                SELECT id, tenant_id, evidence_id, case_id, case_version,
+                       provider, status, extracted_text, source_content_sha256, detail
+                FROM evidence_ocr_results
+                WHERE tenant_id = %s AND case_id = %s AND evidence_id = %s
+                ORDER BY created_at DESC
+                """,
+                (tenant_id, case_id, evidence_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, tenant_id, evidence_id, case_id, case_version,
+                       provider, status, extracted_text, source_content_sha256, detail
+                FROM evidence_ocr_results
+                WHERE tenant_id = %s AND case_id = %s
+                ORDER BY created_at DESC
+                """,
+                (tenant_id, case_id),
+            ).fetchall()
+    return [_row_to_ocr(r) for r in rows]
+
+
+def latest_ocr_by_evidence(
+    *,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+) -> dict[str, EvidenceOcrResult]:
+    """Map evidence_id → newest OCR result for workbench / API summaries."""
+    items = list_ocr_results(
+        database_url=database_url, tenant_id=tenant_id, case_id=case_id
+    )
+    out: dict[str, EvidenceOcrResult] = {}
+    for item in items:
+        if item.evidence_id not in out:
+            out[item.evidence_id] = item
+    return out

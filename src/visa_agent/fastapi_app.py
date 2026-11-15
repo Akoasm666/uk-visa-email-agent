@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from visa_agent.ai_capabilities import (
@@ -23,24 +23,42 @@ from visa_agent.case_service import (
     create_case,
     get_case,
     get_case_review_page,
+    require_customer_email,
+    send_opening_outreach,
+    try_auto_attribute_inbound_by_customer_email,
     get_review_board,
     list_cases,
     mark_inbound_processed,
+    process_inbound_after_attribution,
     record_customer_confirmation,
     record_delivery_receipt,
     record_final_review,
     record_reopen_grant,
+    set_case_route,
     set_takeover,
+)
+from visa_agent.case_service.advisor_actions import (
+    advisor_classify_evidence,
+    advisor_reply_via_agent,
+)
+from visa_agent.case_service.remediation import (
+    acknowledge_advisor_question,
+    list_advisor_alerts,
+    list_open_questions,
 )
 from visa_agent.case_service.service import bump_case_version
 from visa_agent.config import Settings, get_settings
-from visa_agent.domain.enums import CaseStatus, ErrorCode
+from visa_agent.domain.enums import CaseStatus, ErrorCode, RouteCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.document_pipeline import (
     attach_evidence,
+    get_evidence,
+    latest_ocr_by_evidence,
     list_annotations,
     list_evidence,
+    list_ocr_results,
     record_annotation,
+    run_ocr_on_evidence,
     set_evidence_quarantine,
 )
 from visa_agent.email_adapter import (
@@ -52,6 +70,7 @@ from visa_agent.email_adapter import (
 )
 from visa_agent.http_app import build_health
 from visa_agent.rules import (
+    ensure_seed_route_packs,
     ensure_seed_visitor_pack,
     evaluate_case_requirements,
     get_rule_pack,
@@ -63,7 +82,12 @@ from visa_agent.rules import (
 )
 from visa_agent.storage.files import LocalFileStore
 from visa_agent.storage.migrate import apply_migrations
-from visa_agent.workbench.pages import render_detail, render_list
+from visa_agent.workbench.pages import (
+    render_detail,
+    render_evidence_view,
+    render_inbox,
+    render_list,
+)
 from visa_agent.workflow.transitions import apply_transition, list_allowed_targets
 
 app = FastAPI(title="visa-email-agent", version="0.9.0")
@@ -74,13 +98,32 @@ def bootstrap(settings: Settings | None = None) -> Settings:
     boot = settings or get_settings()
     boot.file_storage_dir.mkdir(parents=True, exist_ok=True)
     apply_migrations(boot.database_url)
-    ensure_seed_visitor_pack(database_url=boot.database_url)
+    ensure_seed_route_packs(database_url=boot.database_url)
     return boot
+
+
+def _parse_route_code(value: str | None) -> RouteCode | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return RouteCode(str(value).strip())
+    except ValueError as exc:
+        raise DomainError(
+            code=ErrorCode.VALIDATION_ERROR,
+            message="invalid route",
+            details=(str(value),),
+        ) from exc
 
 
 # Tests set VISA_AGENT_SKIP_APP_BOOT=1 before import, then call bootstrap(test_settings).
 if os.environ.get("VISA_AGENT_SKIP_APP_BOOT") != "1":
     bootstrap()
+
+
+class InboundAttachmentBody(BaseModel):
+    filename: str
+    content_type: str = "application/octet-stream"
+    content_base64: str
 
 
 class InboundBody(BaseModel):
@@ -91,6 +134,7 @@ class InboundBody(BaseModel):
     rfc_message_id: str | None = None
     provider_message_id: str | None = None
     claimed_case_id: str | None = None
+    attachments: list[InboundAttachmentBody] = Field(default_factory=list)
 
 
 class OutboxBody(BaseModel):
@@ -109,6 +153,16 @@ class OutboxBody(BaseModel):
 class CreateCaseBody(BaseModel):
     title: str = ""
     customer_email: str | None = None
+    route: str | None = RouteCode.STANDARD_VISITOR.value
+
+
+class SetRouteBody(BaseModel):
+    route: str
+    expected_case_version: int
+
+
+class EvidenceOcrBody(BaseModel):
+    expected_case_version: int
 
 
 class TransitionBody(BaseModel):
@@ -314,6 +368,17 @@ def health() -> dict[str, Any]:
 @app.post("/internal/email/inbound")
 def inbound_email(body: InboundBody) -> dict[str, Any]:
     settings = get_settings()
+    from visa_agent.email_adapter.inbound import InboundAttachment
+
+    attachments = tuple(
+        InboundAttachment(
+            filename=a.filename,
+            content_type=a.content_type or "application/octet-stream",
+            data=base64.b64decode(a.content_base64, validate=False),
+        )
+        for a in body.attachments
+        if a.content_base64
+    )
     result = persist_inbound(
         database_url=settings.database_url,
         tenant_id=settings.tenant_id,
@@ -325,18 +390,52 @@ def inbound_email(body: InboundBody) -> dict[str, Any]:
             rfc_message_id=body.rfc_message_id,
             provider_message_id=body.provider_message_id,
             claimed_case_id=body.claimed_case_id,
+            attachments=attachments,
         ),
         file_store=LocalFileStore(settings.file_storage_dir),
     )
+    attributed_case_id = None
+    agent_result = None
+    if result.attribution_status == "unattributed" and not result.duplicate:
+        attributed_case_id = try_auto_attribute_inbound_by_customer_email(
+            settings=settings,
+            email_event_id=result.email_event_id,
+            from_addr=body.from_addr,
+        )
+    if attributed_case_id and not result.duplicate:
+        agent_result = process_inbound_after_attribution(
+            settings=settings,
+            case_id=attributed_case_id,
+            email_event_id=result.email_event_id,
+        )
     return {
         "success": True,
         "status_code_hint": 200 if result.duplicate else 201,
         "data": {
             "email_event_id": result.email_event_id,
             "dedupe_key": result.dedupe_key,
-            "attribution_status": result.attribution_status,
+            "attribution_status": (
+                "attributed" if attributed_case_id else result.attribution_status
+            ),
+            "case_id": attributed_case_id,
             "duplicate": result.duplicate,
             "raw_file_id": result.raw_file_id,
+            "agent": (
+                None
+                if agent_result is None
+                else {
+                    "reply_sent": agent_result.reply_sent,
+                    "had_question": agent_result.had_question,
+                    "language": agent_result.language,
+                    "attached": len(agent_result.attached),
+                    "missing_en": list(agent_result.missing_titles_en),
+                    "conclusion": agent_result.conclusion,
+                    "reply_skipped_reason": agent_result.reply_skipped_reason,
+                    "remediations_opened": list(agent_result.remediations_opened),
+                    "remediations_closed": list(agent_result.remediations_closed),
+                    "question_answered": agent_result.question_answered,
+                }
+            ),
         },
     }
 
@@ -391,10 +490,22 @@ def outbox_email(body: OutboxBody) -> dict[str, Any]:
 
 
 @app.get("/cases")
-def api_list_cases() -> dict[str, Any]:
+def api_list_cases(
+    q: str | None = None,
+    status: str | None = None,
+    route: str | None = None,
+    waiting: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
     settings = get_settings()
     cases = list_cases(
-        database_url=settings.database_url, tenant_id=settings.tenant_id
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+        q=q,
+        status=status,
+        route=route,
+        waiting=waiting,
+        limit=limit,
     )
     return {"success": True, "data": [_case_payload(c) for c in cases]}
 
@@ -402,13 +513,86 @@ def api_list_cases() -> dict[str, Any]:
 @app.post("/cases")
 def api_create_case(body: CreateCaseBody) -> dict[str, Any]:
     settings = get_settings()
-    case = create_case(
-        database_url=settings.database_url,
-        tenant_id=settings.tenant_id,
-        title=body.title,
-        customer_email=body.customer_email,
-    )
+    try:
+        route = _parse_route_code(body.route)
+        if route is None:
+            route = RouteCode.STANDARD_VISITOR
+        email = (
+            require_customer_email(body.customer_email)
+            if body.customer_email
+            else None
+        )
+        case = create_case(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            title=body.title,
+            customer_email=email,
+            route=route,
+        )
+        outreach = (
+            send_opening_outreach(settings=settings, case=case)
+            if email
+            else None
+        )
+        case = get_case(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case.id,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    payload = _case_payload(case)
+    if outreach is not None:
+        payload["opening_outreach"] = {
+            "attempted": outreach.attempted,
+            "sent": outreach.sent,
+            "skipped_reason": outreach.skipped_reason,
+            "outbox_id": outreach.outbox.outbox_id if outreach.outbox else None,
+            "outbox_status": outreach.outbox.status if outreach.outbox else None,
+        }
+    return {"success": True, "data": payload}
+
+
+@app.post("/cases/{case_id}/route")
+def api_set_case_route(case_id: str, body: SetRouteBody) -> dict[str, Any]:
+    settings = get_settings()
+    try:
+        route = _parse_route_code(body.route)
+        if route is None:
+            raise DomainError(
+                code=ErrorCode.VALIDATION_ERROR,
+                message="route is required",
+            )
+        case = set_case_route(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            route=route,
+            expected_case_version=body.expected_case_version,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
     return {"success": True, "data": _case_payload(case)}
+
+
+@app.get("/routes")
+def api_list_routes() -> dict[str, Any]:
+    """Supported UK visa routes for case create / rebind."""
+    return {
+        "success": True,
+        "data": [
+            {
+                "code": RouteCode.STANDARD_VISITOR.value,
+                "label": "Standard Visitor",
+            },
+            {"code": RouteCode.STUDENT.value, "label": "Student"},
+            {
+                "code": RouteCode.SKILLED_WORKER.value,
+                "label": "Skilled Worker",
+            },
+            {"code": RouteCode.GRADUATE.value, "label": "Graduate"},
+        ],
+    }
 
 
 @app.get("/cases/{case_id}")
@@ -594,9 +778,27 @@ def api_attribute(case_id: str, body: AttributeBody) -> dict[str, Any]:
         )
     except DomainError as exc:
         raise _domain_http(exc) from exc
+    agent_result = process_inbound_after_attribution(
+        settings=settings,
+        case_id=case_id,
+        email_event_id=body.email_event_id,
+    )
     return {
         "success": True,
-        "data": {"case_id": case_id, "email_event_id": body.email_event_id},
+        "data": {
+            "case_id": case_id,
+            "email_event_id": body.email_event_id,
+            "agent": (
+                None
+                if agent_result is None
+                else {
+                    "reply_sent": agent_result.reply_sent,
+                    "had_question": agent_result.had_question,
+                    "attached": len(agent_result.attached),
+                    "conclusion": agent_result.conclusion,
+                }
+            ),
+        },
     }
 
 
@@ -669,6 +871,20 @@ def _evidence_payload(ev: Any) -> dict[str, Any]:
         "quarantine_status": ev.quarantine_status,
         "rejection_reason": ev.rejection_reason,
         "source_email_event_id": ev.source_email_event_id,
+    }
+
+
+def _ocr_payload(ocr: Any) -> dict[str, Any]:
+    return {
+        "ocr_id": ocr.id,
+        "evidence_id": ocr.evidence_id,
+        "case_id": ocr.case_id,
+        "case_version": ocr.case_version,
+        "provider": ocr.provider,
+        "status": ocr.status,
+        "extracted_text": ocr.extracted_text,
+        "source_content_sha256": ocr.source_content_sha256,
+        "detail": ocr.detail,
     }
 
 
@@ -789,6 +1005,48 @@ def api_list_annotations(case_id: str, evidence_id: str) -> dict[str, Any]:
             for a in items
         ],
     }
+
+
+@app.post("/cases/{case_id}/evidence/{evidence_id}/ocr")
+def api_run_ocr(case_id: str, evidence_id: str, body: EvidenceOcrBody) -> dict[str, Any]:
+    """Run derived OCR; never mutates quarantine original bytes or auto-confirms fields."""
+    settings = get_settings()
+    try:
+        ocr = run_ocr_on_evidence(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            evidence_id=evidence_id,
+            file_store=LocalFileStore(settings.file_storage_dir),
+            expected_case_version=body.expected_case_version,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    return {"success": True, "data": _ocr_payload(ocr)}
+
+
+@app.get("/cases/{case_id}/ocr")
+def api_list_case_ocr(case_id: str, evidence_id: str | None = None) -> dict[str, Any]:
+    settings = get_settings()
+    items = list_ocr_results(
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+        case_id=case_id,
+        evidence_id=evidence_id,
+    )
+    return {"success": True, "data": [_ocr_payload(o) for o in items]}
+
+
+@app.get("/cases/{case_id}/evidence/{evidence_id}/ocr")
+def api_list_evidence_ocr(case_id: str, evidence_id: str) -> dict[str, Any]:
+    settings = get_settings()
+    items = list_ocr_results(
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+        case_id=case_id,
+        evidence_id=evidence_id,
+    )
+    return {"success": True, "data": [_ocr_payload(o) for o in items]}
 
 
 @app.get("/rule-packs")
@@ -931,7 +1189,9 @@ def api_list_visitor_scenarios() -> dict[str, Any]:
             "route": "standard_visitor",
             "scenario_ids": list(SCENARIO_IDS),
             "notes": (
-                "Visitor only — Student/Worker packs deferred. "
+                "Canned scenarios are Standard Visitor only. "
+                "Student / Skilled Worker / Graduate use seeded route packs "
+                "via /routes + /cases/{id}/active-pack. "
                 "Outcomes follow shared signal assessment (not scenario-id hardcoding). "
                 "Formal evaluate S3 gates require published standard_visitor v2."
             ),
@@ -1232,25 +1492,179 @@ def _wb_redirect(case_id: str, msg: str) -> RedirectResponse:
 
 
 @app.get("/workbench", response_class=HTMLResponse)
-def workbench_list() -> HTMLResponse:
+def workbench_list(
+    request: Request,
+    q: str | None = None,
+    status: str | None = None,
+    route: str | None = None,
+    waiting: str | None = None,
+) -> HTMLResponse:
     settings = get_settings()
     cases = list_cases(
-        database_url=settings.database_url, tenant_id=settings.tenant_id
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+        q=q,
+        status=status,
+        route=route,
+        waiting=waiting,
+        limit=100,
     )
-    return HTMLResponse(render_list(cases))
+    alert_count = len(
+        list_advisor_alerts(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+        )
+    )
+    return HTMLResponse(
+        render_list(
+            cases,
+            alert_count=alert_count,
+            filters={
+                "q": q or "",
+                "status": status or "",
+                "route": route or "",
+                "waiting": waiting or "",
+            },
+            message=request.query_params.get("msg"),
+        )
+    )
+
+
+@app.get("/workbench/inbox", response_class=HTMLResponse)
+def workbench_inbox(request: Request) -> HTMLResponse:
+    """Advisor reminder page — separate from the case list home."""
+    settings = get_settings()
+    alerts = list_advisor_alerts(
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+    )
+    return HTMLResponse(
+        render_inbox(alerts, message=request.query_params.get("msg"))
+    )
+
+
+@app.post("/workbench/cases/{case_id}/advisor-ack")
+async def workbench_advisor_ack(case_id: str, request: Request) -> RedirectResponse:
+    """Advisor marks an escalated inbox item as handled (no forced takeover)."""
+    form = await _form(request)
+    settings = get_settings()
+    qid = (form.get("question_id") or "").strip()
+    next_to = (form.get("next") or "").strip().lower()
+
+    def _after(msg: str) -> RedirectResponse:
+        qmsg = quote(msg)
+        if next_to == "case":
+            return RedirectResponse(
+                url=f"/workbench/cases/{case_id}?msg={qmsg}#advisor-work",
+                status_code=303,
+            )
+        return RedirectResponse(
+            url=f"/workbench/inbox?msg={qmsg}", status_code=303
+        )
+
+    if not qid:
+        return _after("缺少待办 id")
+    closed = acknowledge_advisor_question(
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+        case_id=case_id,
+        question_id=qid,
+        actor="advisor",
+    )
+    if closed is None:
+        return _after("待办不存在或已处理")
+    return _after("已标记处理")
+
+
+@app.post("/workbench/cases/{case_id}/evidence/{evidence_id}/classify")
+async def workbench_classify_evidence(
+    case_id: str, evidence_id: str, request: Request
+) -> RedirectResponse:
+    """Advisor assigns a material type on unclassified evidence."""
+    form = await _form(request)
+    settings = get_settings()
+    try:
+        result = advisor_classify_evidence(
+            settings=settings,
+            case_id=case_id,
+            evidence_id=evidence_id,
+            classification=str(form.get("classification") or ""),
+            question_id=(form.get("question_id") or None),
+        )
+        label = result.evidence.classification
+        msg = f"已归类为 {label}"
+        if result.closed_unclassified:
+            msg += "，顾问分类待办已关闭"
+    except DomainError as exc:
+        msg = str(exc)
+    return RedirectResponse(
+        url=f"/workbench/cases/{case_id}?msg={quote(msg)}#unclassified-materials",
+        status_code=303,
+    )
+
+
+@app.post("/workbench/cases/{case_id}/advisor-reply")
+async def workbench_advisor_reply(case_id: str, request: Request) -> RedirectResponse:
+    """Advisor answer → agent outbox → customer (not a side-channel SMTP)."""
+    form = await _form(request)
+    settings = get_settings()
+    try:
+        result = advisor_reply_via_agent(
+            settings=settings,
+            case_id=case_id,
+            body_text=str(form.get("body") or ""),
+            question_id=(form.get("question_id") or None) or None,
+        )
+        if result.outbox.block_reasons:
+            msg = "出箱被拦住：" + ",".join(result.outbox.block_reasons)
+        elif result.outbox.status in {
+            "provider_accepted",
+            "pending",
+            "status_unknown",
+        }:
+            msg = "已由 Agent 发给客户"
+            if result.closed_question:
+                msg += "，提问待办已关闭"
+        else:
+            msg = f"发送状态：{result.outbox.status}"
+    except DomainError as exc:
+        msg = str(exc)
+    return RedirectResponse(
+        url=f"/workbench/cases/{case_id}?msg={quote(msg)}#advisor-work",
+        status_code=303,
+    )
 
 
 @app.post("/workbench/cases")
 async def workbench_create(request: Request) -> RedirectResponse:
     form = await _form(request)
     settings = get_settings()
-    case = create_case(
-        database_url=settings.database_url,
-        tenant_id=settings.tenant_id,
-        title=form.get("title") or "",
-        customer_email=form.get("customer_email") or None,
+    try:
+        route = _parse_route_code(form.get("route"))
+        if route is None:
+            route = RouteCode.STANDARD_VISITOR
+        email = require_customer_email(form.get("customer_email"))
+        case = create_case(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            title=form.get("title") or "",
+            customer_email=email,
+            route=route,
+        )
+        outreach = send_opening_outreach(settings=settings, case=case)
+    except DomainError as exc:
+        return RedirectResponse(
+            url=f"/workbench?msg={quote(str(exc))}", status_code=303
+        )
+    if outreach.sent:
+        msg = "案件已创建，已向客户发出首封邮件"
+    elif outreach.skipped_reason:
+        msg = f"案件已创建，但首封邮件未发出：{outreach.skipped_reason}"
+    else:
+        msg = "案件已创建"
+    return RedirectResponse(
+        url=f"/workbench/cases/{case.id}?msg={quote(msg)}", status_code=303
     )
-    return RedirectResponse(url=f"/workbench/cases/{case.id}", status_code=303)
 
 
 @app.get("/workbench/cases/{case_id}", response_class=HTMLResponse)
@@ -1280,6 +1694,40 @@ def workbench_detail(case_id: str, request: Request) -> HTMLResponse:
         tenant_id=settings.tenant_id,
         case_id=case_id,
     )
+    ocr_map = latest_ocr_by_evidence(
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+        case_id=case_id,
+    )
+    requirement_states: list[Any] = []
+    requirement_titles: dict[str, str] = {}
+    try:
+        evaluated = evaluate_case_requirements(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+        )
+        requirement_states = list(evaluated.states)
+        pack = get_rule_pack(
+            database_url=settings.database_url,
+            pack_id=evaluated.pack_id,
+            pack_version=evaluated.pack_version,
+        )
+        requirement_titles = {r.key: r.title for r in pack.requirements}
+    except DomainError:
+        requirement_states = list(
+            list_case_requirements(
+                database_url=settings.database_url,
+                tenant_id=settings.tenant_id,
+                case_id=case_id,
+            )
+        )
+    advisor_items = list_open_questions(
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+        case_id=case_id,
+        active_only=True,
+    )
     msg = request.query_params.get("msg")
     return HTMLResponse(
         render_detail(
@@ -1289,8 +1737,38 @@ def workbench_detail(case_id: str, request: Request) -> HTMLResponse:
             drafts=drafts,
             evidence_items=evidence_items,
             review_board=board,
+            ocr_by_evidence=ocr_map,
+            requirement_states=requirement_states,
+            requirement_titles=requirement_titles or None,
+            advisor_items=advisor_items,
         )
     )
+
+
+@app.post("/workbench/cases/{case_id}/route")
+async def workbench_set_route(case_id: str, request: Request) -> RedirectResponse:
+    form = await _form(request)
+    settings = get_settings()
+    try:
+        route = _parse_route_code(form.get("route"))
+        if route is None:
+            raise DomainError(
+                code=ErrorCode.VALIDATION_ERROR,
+                message="route is required",
+            )
+        case = set_case_route(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            route=route,
+            expected_case_version=_parse_expected_version(
+                form.get("expected_case_version")
+            ),
+        )
+        msg = f"route set to {case.route.value if case.route else '?'}"
+    except (DomainError, ValueError) as exc:
+        msg = str(exc)
+    return _wb_redirect(case_id, msg)
 
 
 @app.post("/workbench/cases/{case_id}/transition")
@@ -1407,33 +1885,169 @@ async def workbench_draft(case_id: str) -> RedirectResponse:
     return _wb_redirect(case_id, msg)
 
 
+def _workbench_evidence_path(case_id: str, evidence_id: str):
+    settings = get_settings()
+    evidence = get_evidence(
+        database_url=settings.database_url,
+        tenant_id=settings.tenant_id,
+        case_id=case_id,
+        evidence_id=evidence_id,
+    )
+    path = LocalFileStore(settings.file_storage_dir).path_for_file_id(
+        evidence.file_id
+    )
+    if not path.is_file():
+        raise DomainError(
+            code=ErrorCode.NOT_FOUND,
+            message="evidence file missing on disk",
+            details=(evidence_id, evidence.file_id),
+        )
+    return settings, evidence, path
+
+
+@app.get("/workbench/cases/{case_id}/evidence/{evidence_id}/file")
+def workbench_evidence_file(
+    case_id: str, evidence_id: str, download: int = 0
+) -> FileResponse:
+    """Serve original bytes for in-browser view or forced download."""
+    try:
+        _settings, evidence, path = _workbench_evidence_path(case_id, evidence_id)
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    headers = {}
+    filename = evidence.original_filename or "evidence.bin"
+    if download:
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    else:
+        headers["Content-Disposition"] = f'inline; filename="{filename}"'
+    return FileResponse(
+        path,
+        media_type=evidence.content_type or "application/octet-stream",
+        filename=filename if download else None,
+        headers=headers,
+    )
+
+
+@app.get(
+    "/workbench/cases/{case_id}/evidence/{evidence_id}/view",
+    response_class=HTMLResponse,
+)
+def workbench_evidence_view(case_id: str, evidence_id: str) -> HTMLResponse:
+    """Open material in workbench chrome — text inline, else iframe/download."""
+    settings = get_settings()
+    try:
+        case = get_case(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+        )
+        evidence = get_evidence(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            evidence_id=evidence_id,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+
+    path = LocalFileStore(settings.file_storage_dir).path_for_file_id(
+        evidence.file_id
+    )
+    if not path.is_file():
+        # Stale DB row / moved storage — don't dump a bare 404 JSON page.
+        return HTMLResponse(
+            render_evidence_view(
+                case,
+                evidence=evidence,
+                text_preview=(
+                    "这份材料的原件在服务器上找不到了（可能是之前的演示上传）。"
+                    "请回到案件，在对应清单项里重新从本地上传。"
+                ),
+                can_inline_frame=False,
+            ),
+            status_code=404,
+        )
+
+    ctype = (evidence.content_type or "").lower()
+    name = (evidence.original_filename or "").lower()
+    text_preview: str | None = None
+    can_inline = False
+    data = path.read_bytes()
+    if (
+        ctype.startswith("text/")
+        or name.endswith((".txt", ".csv", ".md", ".json", ".xml", ".html", ".htm"))
+        or ctype in {"application/json", "application/xml"}
+    ):
+        try:
+            text_preview = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text_preview = data.decode("utf-8", errors="replace")
+    elif ctype.startswith("image/") or name.endswith(
+        (".png", ".jpg", ".jpeg", ".gif", ".webp")
+    ):
+        can_inline = True
+    elif ctype == "application/pdf" or name.endswith(".pdf"):
+        can_inline = True
+    return HTMLResponse(
+        render_evidence_view(
+            case,
+            evidence=evidence,
+            text_preview=text_preview,
+            can_inline_frame=can_inline,
+        )
+    )
+
+
 @app.post("/workbench/cases/{case_id}/evidence")
 async def workbench_attach_evidence(
     case_id: str, request: Request
 ) -> RedirectResponse:
-    form = await _form(request)
+    """Accept a real local file upload (multipart) into quarantine storage."""
+    form = await request.form()
     settings = get_settings()
     try:
-        text = form.get("content_text") or ""
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "read"):
+            raise DomainError(
+                code=ErrorCode.VALIDATION_ERROR,
+                message="请选择要上传的本地文件",
+            )
+        data = await upload.read()  # type: ignore[misc]
+        filename = (getattr(upload, "filename", None) or "").strip() or "upload.bin"
+        content_type = (
+            getattr(upload, "content_type", None) or "application/octet-stream"
+        )
+        store = LocalFileStore(settings.file_storage_dir)
         evidence = attach_evidence(
             database_url=settings.database_url,
             tenant_id=settings.tenant_id,
             case_id=case_id,
-            file_store=LocalFileStore(settings.file_storage_dir),
-            data=text.encode("utf-8"),
-            original_filename=form.get("filename") or "untitled.txt",
-            content_type="text/plain; charset=utf-8",
-            classification=form.get("classification") or "unclassified",
+            file_store=store,
+            data=data,
+            original_filename=filename,
+            content_type=str(content_type),
+            classification=str(form.get("classification") or "unclassified"),
             expected_case_version=_parse_expected_version(
-                form.get("expected_case_version")
+                str(form.get("expected_case_version") or "") or None
             ),
         )
-        msg = (
-            f"evidence isolated ({evidence.id[:8]}) "
-            f"status={evidence.quarantine_status} @ v{evidence.case_version}"
-        )
+        # Best-effort OCR so「查看」旁状态能更新；失败不挡上传。
+        try:
+            run_ocr_on_evidence(
+                database_url=settings.database_url,
+                tenant_id=settings.tenant_id,
+                case_id=case_id,
+                evidence_id=evidence.id,
+                file_store=store,
+                expected_case_version=evidence.case_version,
+            )
+        except DomainError:
+            pass
+        msg = f"已上传：{filename}"
     except DomainError as exc:
         msg = str(exc)
+    except Exception as exc:  # noqa: BLE001 — surface upload IO errors in flash
+        msg = f"上传失败：{exc}"
     return _wb_redirect(case_id, msg)
 
 
@@ -1457,6 +2071,33 @@ async def workbench_annotate(
             ),
         )
         msg = f"annotated {ann.field_key} @ v{ann.case_version}"
+    except DomainError as exc:
+        msg = str(exc)
+    return _wb_redirect(case_id, msg)
+
+
+@app.post("/workbench/cases/{case_id}/evidence/{evidence_id}/ocr")
+async def workbench_run_ocr(
+    case_id: str, evidence_id: str, request: Request
+) -> RedirectResponse:
+    form = await _form(request)
+    settings = get_settings()
+    try:
+        ocr = run_ocr_on_evidence(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            evidence_id=evidence_id,
+            file_store=LocalFileStore(settings.file_storage_dir),
+            expected_case_version=_parse_expected_version(
+                form.get("expected_case_version")
+            ),
+        )
+        preview = (ocr.extracted_text or "")[:80].replace("\n", " ")
+        msg = (
+            f"OCR {ocr.status} via {ocr.provider} @ v{ocr.case_version}"
+            + (f": {preview}" if preview else "")
+        )
     except DomainError as exc:
         msg = str(exc)
     return _wb_redirect(case_id, msg)

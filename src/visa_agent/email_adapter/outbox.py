@@ -17,6 +17,7 @@ from psycopg.errors import UniqueViolation
 from visa_agent.config import Settings
 from visa_agent.domain.enums import OutboundMessageKind
 from visa_agent.domain.models import OutboundGateInput, evaluate_outbound_gate
+from visa_agent.email_adapter.allowlist import effective_outbound_allowlist
 from visa_agent.email_adapter.errors import (
     SendPartialAcceptedError,
     SendStatusUnknownError,
@@ -41,6 +42,8 @@ class OutboxRequest:
     body_text: str
     send_operation_id: str | None = None
     send_now: bool = True
+    case_id: str | None = None
+    case_version: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +128,7 @@ def _gate_input(settings: Settings, req: OutboxRequest) -> OutboundGateInput:
     return OutboundGateInput(
         kind=req.kind,
         recipient_emails=frozenset(req.recipients),
-        allowlist=settings.outbound_allowlist,
+        allowlist=effective_outbound_allowlist(settings),
         human_takeover=False,
         human_send_approved=False,
         case_version=1,
@@ -274,7 +277,7 @@ def enqueue_and_maybe_send(
                                 id, tenant_id, send_operation_id, case_id, case_version,
                                 kind, recipients, subject, body_text, status, block_reasons
                             ) VALUES (
-                                %s, %s, %s, NULL, 1,
+                                %s, %s, %s, %s, %s,
                                 %s, %s::jsonb, %s, %s, 'blocked', %s::jsonb
                             )
                             """,
@@ -282,6 +285,8 @@ def enqueue_and_maybe_send(
                                 outbox_id,
                                 settings.tenant_id,
                                 op_id,
+                                req.case_id,
+                                req.case_version if req.case_version is not None else 1,
                                 req.kind,
                                 json.dumps(list(req.recipients)),
                                 req.subject,
@@ -324,7 +329,7 @@ def enqueue_and_maybe_send(
                             id, tenant_id, send_operation_id, case_id, case_version,
                             kind, recipients, subject, body_text, status, block_reasons
                         ) VALUES (
-                            %s, %s, %s, NULL, 1,
+                            %s, %s, %s, %s, %s,
                             %s, %s::jsonb, %s, %s, 'pending', '[]'::jsonb
                         )
                         """,
@@ -332,6 +337,8 @@ def enqueue_and_maybe_send(
                             outbox_id,
                             settings.tenant_id,
                             op_id,
+                            req.case_id,
+                            req.case_version if req.case_version is not None else 1,
                             req.kind,
                             json.dumps(list(req.recipients)),
                             req.subject,

@@ -16,6 +16,25 @@ from visa_agent.case_service.service import (
 from visa_agent.domain.enums import ErrorCode, RequirementStatus, RouteCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.rules.seed import (
+    GRADUATE_PACK_ID,
+    GRADUATE_PACK_TITLE,
+    GRADUATE_PACK_VERSION,
+    GRADUATE_REQUIREMENTS,
+    GRADUATE_SOURCE_RETRIEVED_ON,
+    GRADUATE_SOURCE_URL,
+    SKILLED_WORKER_PACK_ID,
+    SKILLED_WORKER_PACK_TITLE,
+    SKILLED_WORKER_PACK_VERSION,
+    SKILLED_WORKER_REQUIREMENTS,
+    SKILLED_WORKER_SOURCE_RETRIEVED_ON,
+    SKILLED_WORKER_SOURCE_URL,
+    STUDENT_PACK_ID,
+    STUDENT_PACK_TITLE,
+    STUDENT_PACK_VERSION,
+    STUDENT_REQUIREMENTS,
+    STUDENT_SOURCE_RETRIEVED_ON,
+    STUDENT_SOURCE_URL,
+    SeedRequirement,
     VISITOR_PACK_ID,
     VISITOR_PACK_TITLE,
     VISITOR_PACK_TITLE_S3,
@@ -36,8 +55,9 @@ _PASS_STATUSES = frozenset(
     }
 )
 
-# Evidence classifications that weakly map to visitor themes (demo heuristic).
+# Evidence classifications that weakly map to requirement themes (demo heuristic).
 _CLASSIFICATION_HINTS: dict[str, str] = {
+    # Visitor
     "passport": "passport_valid",
     "bank": "funds_for_stay",
     "funds": "funds_for_stay",
@@ -46,6 +66,26 @@ _CLASSIFICATION_HINTS: dict[str, str] = {
     "itinerary": "intention_to_leave",
     "employment": "home_ties",
     "purpose": "visit_purpose_allowed",
+    # Student
+    "cas": "cas_confirmation",
+    "maintenance": "funds_maintenance",
+    "course": "course_offer",
+    "offer": "course_offer",
+    # Skilled Worker
+    "cos": "certificate_of_sponsorship",
+    "sponsorship": "certificate_of_sponsorship",
+    "salary": "salary_threshold",
+    "skill": "job_skill_level",
+    # Shared Student / SW
+    "english": "english_language",
+    "tb": "tuberculosis_test_if_required",
+    "tuberculosis": "tuberculosis_test_if_required",
+    # Graduate
+    "degree": "qualification_confirmed",
+    "qualification": "qualification_confirmed",
+    "graduation": "uk_study_completed",
+    "uk_study": "uk_study_completed",
+    "permission": "current_permission_basis",
 }
 
 _SEED_LOCK_K1 = 920522
@@ -116,12 +156,16 @@ def _row_to_pack(row: tuple, reqs: list[tuple]) -> RulePack:
     )
 
 
-def _insert_visitor_pack_version(
+def _insert_pack_version(
     conn: psycopg.Connection,
     *,
+    pack_id: str,
     pack_version: int,
+    route: str,
     title: str,
+    source_url: str,
     retrieved_on: str,
+    requirements: tuple[SeedRequirement, ...],
 ) -> None:
     """Insert one pack version if absent. Never updates existing rows."""
     existing = conn.execute(
@@ -129,7 +173,7 @@ def _insert_visitor_pack_version(
         SELECT pack_id FROM rule_packs
         WHERE pack_id = %s AND pack_version = %s
         """,
-        (VISITOR_PACK_ID, pack_version),
+        (pack_id, pack_version),
     ).fetchone()
     if existing is not None:
         return
@@ -141,15 +185,15 @@ def _insert_visitor_pack_version(
         ) VALUES (%s, %s, %s, %s, %s, %s, FALSE)
         """,
         (
-            VISITOR_PACK_ID,
+            pack_id,
             pack_version,
-            RouteCode.STANDARD_VISITOR.value,
+            route,
             title,
-            VISITOR_SOURCE_URL,
+            source_url,
             date.fromisoformat(retrieved_on),
         ),
     )
-    for req in VISITOR_REQUIREMENTS:
+    for req in requirements:
         conn.execute(
             """
             INSERT INTO rule_requirements (
@@ -159,7 +203,7 @@ def _insert_visitor_pack_version(
             """,
             (
                 uuid.uuid4().hex,
-                VISITOR_PACK_ID,
+                pack_id,
                 pack_version,
                 req.key,
                 req.title,
@@ -169,13 +213,43 @@ def _insert_visitor_pack_version(
         )
 
 
+def _insert_visitor_pack_version(
+    conn: psycopg.Connection,
+    *,
+    pack_version: int,
+    title: str,
+    retrieved_on: str,
+) -> None:
+    _insert_pack_version(
+        conn,
+        pack_id=VISITOR_PACK_ID,
+        pack_version=pack_version,
+        route=RouteCode.STANDARD_VISITOR.value,
+        title=title,
+        source_url=VISITOR_SOURCE_URL,
+        retrieved_on=retrieved_on,
+        requirements=VISITOR_REQUIREMENTS,
+    )
+
+
 def ensure_seed_visitor_pack(*, database_url: str) -> RulePack:
     """Insert Visitor pack v1 and S3 v2 when absent.
 
     Never mutates an existing pack (published or not). S3 evaluator changes
     live on v2 — publish + rebind via impact scan / set_case_active_pack.
     Returns v1 for backward-compatible callers.
+    Also seeds Student / Skilled Worker / Graduate v1 packs (idempotent).
     """
+    ensure_seed_route_packs(database_url=database_url)
+    return get_rule_pack(
+        database_url=database_url,
+        pack_id=VISITOR_PACK_ID,
+        pack_version=VISITOR_PACK_VERSION,
+    )
+
+
+def ensure_seed_route_packs(*, database_url: str) -> list[RulePack]:
+    """Seed Visitor (+ S3 v2), Student, Skilled Worker, Graduate packs when absent."""
     with psycopg.connect(database_url) as conn:
         with conn.transaction():
             conn.execute(
@@ -194,10 +268,75 @@ def ensure_seed_visitor_pack(*, database_url: str) -> RulePack:
                 title=VISITOR_PACK_TITLE_S3,
                 retrieved_on=VISITOR_SOURCE_RETRIEVED_ON_S3,
             )
-    return get_rule_pack(
-        database_url=database_url,
-        pack_id=VISITOR_PACK_ID,
-        pack_version=VISITOR_PACK_VERSION,
+            _insert_pack_version(
+                conn,
+                pack_id=STUDENT_PACK_ID,
+                pack_version=STUDENT_PACK_VERSION,
+                route=RouteCode.STUDENT.value,
+                title=STUDENT_PACK_TITLE,
+                source_url=STUDENT_SOURCE_URL,
+                retrieved_on=STUDENT_SOURCE_RETRIEVED_ON,
+                requirements=STUDENT_REQUIREMENTS,
+            )
+            _insert_pack_version(
+                conn,
+                pack_id=SKILLED_WORKER_PACK_ID,
+                pack_version=SKILLED_WORKER_PACK_VERSION,
+                route=RouteCode.SKILLED_WORKER.value,
+                title=SKILLED_WORKER_PACK_TITLE,
+                source_url=SKILLED_WORKER_SOURCE_URL,
+                retrieved_on=SKILLED_WORKER_SOURCE_RETRIEVED_ON,
+                requirements=SKILLED_WORKER_REQUIREMENTS,
+            )
+            _insert_pack_version(
+                conn,
+                pack_id=GRADUATE_PACK_ID,
+                pack_version=GRADUATE_PACK_VERSION,
+                route=RouteCode.GRADUATE.value,
+                title=GRADUATE_PACK_TITLE,
+                source_url=GRADUATE_SOURCE_URL,
+                retrieved_on=GRADUATE_SOURCE_RETRIEVED_ON,
+                requirements=GRADUATE_REQUIREMENTS,
+            )
+    return [
+        get_rule_pack(
+            database_url=database_url,
+            pack_id=VISITOR_PACK_ID,
+            pack_version=VISITOR_PACK_VERSION,
+        ),
+        get_rule_pack(
+            database_url=database_url,
+            pack_id=STUDENT_PACK_ID,
+            pack_version=STUDENT_PACK_VERSION,
+        ),
+        get_rule_pack(
+            database_url=database_url,
+            pack_id=SKILLED_WORKER_PACK_ID,
+            pack_version=SKILLED_WORKER_PACK_VERSION,
+        ),
+        get_rule_pack(
+            database_url=database_url,
+            pack_id=GRADUATE_PACK_ID,
+            pack_version=GRADUATE_PACK_VERSION,
+        ),
+    ]
+
+
+def default_pack_for_route(route: RouteCode | str) -> tuple[str, int]:
+    """Canonical seed pack id + version for a route (unpublished until publish)."""
+    code = route.value if isinstance(route, RouteCode) else str(route)
+    if code == RouteCode.STANDARD_VISITOR.value:
+        return VISITOR_PACK_ID, VISITOR_PACK_VERSION
+    if code == RouteCode.STUDENT.value:
+        return STUDENT_PACK_ID, STUDENT_PACK_VERSION
+    if code == RouteCode.SKILLED_WORKER.value:
+        return SKILLED_WORKER_PACK_ID, SKILLED_WORKER_PACK_VERSION
+    if code == RouteCode.GRADUATE.value:
+        return GRADUATE_PACK_ID, GRADUATE_PACK_VERSION
+    raise DomainError(
+        code=ErrorCode.VALIDATION_ERROR,
+        message="unsupported route for rule pack binding",
+        details=(code,),
     )
 
 
@@ -430,12 +569,15 @@ def _hint_status_for_requirement(
     annotation_keys: set[str],
     annotation_pairs: list | None = None,
     pack_version: int = 1,
+    route: str | None = None,
 ) -> tuple[str, str]:
     """Demo heuristic: map isolated evidence / annotations to requirement states.
 
     Unknown stays unknown — never treated as pass.
-    Pack v1: legacy key-presence transfer; no student-funds formula gate.
-    Pack v2+ (S3): shared visitor_pack polarity + funds-context formula gate.
+    Visitor pack v1: legacy key-presence transfer; no student-funds formula gate.
+    Visitor pack v2+ (S3): shared visitor_pack polarity + funds-context formula gate.
+    Student / Skilled Worker / Graduate: classification/annotation hints only
+    (no Visitor polarity / student-funds gates).
     """
     from visa_agent.rules.visitor_pack import (
         AnnotationPair,
@@ -444,8 +586,9 @@ def _hint_status_for_requirement(
     )
 
     pairs: list[AnnotationPair] = list(annotation_pairs or [])
+    is_visitor = route in (None, RouteCode.STANDARD_VISITOR.value)
 
-    if pack_version >= VISITOR_PACK_VERSION_S3:
+    if is_visitor and pack_version >= VISITOR_PACK_VERSION_S3:
         assessment = assess_visitor_signals(
             classifications=classifications,
             annotations=pairs,
@@ -470,18 +613,17 @@ def _hint_status_for_requirement(
                 RequirementStatus.NEEDS_CORRECTION.value,
                 "Student fixed-funds / CAS formula citation rejected for Visitor",
             )
-    else:
-        # v1 frozen behaviour: key presence only; no student-funds formula gate.
-        if severity == "transfer_human":
-            if detect_transfer_triggers(annotation_keys):
-                return (
-                    RequirementStatus.NEEDS_CORRECTION.value,
-                    "transfer-to-human trigger annotated; human review required",
-                )
+    elif severity == "transfer_human":
+        # Visitor v1 + Student/SW: key presence only.
+        if detect_transfer_triggers(annotation_keys):
             return (
-                RequirementStatus.APPLICABILITY_UNKNOWN.value,
-                "transfer-human applicability not yet assessed",
+                RequirementStatus.NEEDS_CORRECTION.value,
+                "transfer-to-human trigger annotated; human review required",
             )
+        return (
+            RequirementStatus.APPLICABILITY_UNKNOWN.value,
+            "transfer-human applicability not yet assessed",
+        )
 
     matched_class = any(
         _CLASSIFICATION_HINTS.get(c) == requirement_key for c in classifications
@@ -503,6 +645,16 @@ def _hint_status_for_requirement(
         return (
             RequirementStatus.APPLICABILITY_UNKNOWN.value,
             "sponsor applicability unknown without evidence or annotation",
+        )
+    if (
+        requirement_key == "tuberculosis_test_if_required"
+        and "tb" not in classifications
+        and "tuberculosis" not in classifications
+        and requirement_key not in annotation_keys
+    ):
+        return (
+            RequirementStatus.APPLICABILITY_UNKNOWN.value,
+            "TB applicability unknown without evidence or annotation",
         )
     return (
         RequirementStatus.APPLICABLE_MISSING.value,
@@ -582,6 +734,20 @@ def evaluate_case_requirements(
             classifications = {
                 (r[0] or "unclassified").strip().lower() for r in class_rows
             }
+            remediation_rows = conn.execute(
+                """
+                SELECT requirement_key, reason_detail
+                FROM open_questions
+                WHERE tenant_id = %s AND case_id = %s
+                  AND status IN ('open', 'waiting_customer', 'escalated_human')
+                """,
+                (tenant_id, case_id),
+            ).fetchall()
+            open_remediations = {
+                (r[0] or "").strip(): (r[1] or "").strip()
+                for r in remediation_rows
+                if (r[0] or "").strip()
+            }
             ann_rows = conn.execute(
                 """
                 SELECT a.field_key, a.field_value
@@ -637,7 +803,14 @@ def evaluate_case_requirements(
                     annotation_keys=annotation_keys,
                     annotation_pairs=annotation_pairs,
                     pack_version=pack.pack_version,
+                    route=pack.route,
                 )
+                if req.key in open_remediations:
+                    status = RequirementStatus.NEEDS_CORRECTION.value
+                    reason = (
+                        open_remediations[req.key]
+                        or "open remediation: awaiting clearer re-upload"
+                    )
                 states.append(
                     CaseRequirementState(
                         requirement_key=req.key,

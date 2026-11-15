@@ -13,7 +13,11 @@ from typing import Protocol
 from visa_agent.config import Settings
 from visa_agent.domain.enums import ErrorCode
 from visa_agent.domain.errors import DomainError
-from visa_agent.email_adapter.inbound import InboundEmail, persist_inbound
+from visa_agent.email_adapter.inbound import (
+    InboundAttachment,
+    InboundEmail,
+    persist_inbound,
+)
 from visa_agent.storage.files import LocalFileStore
 
 
@@ -93,6 +97,39 @@ def _body_text(msg: Message) -> str:
     payload = msg.get_payload(decode=True) or b""
     charset = msg.get_content_charset() or "utf-8"
     return payload.decode(charset, errors="replace")
+
+
+def _extract_attachments(msg: Message) -> tuple[InboundAttachment, ...]:
+    """Pull attachment parts (and inline non-text binaries) from a MIME message."""
+    items: list[InboundAttachment] = []
+    if not msg.is_multipart():
+        return ()
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        disp = str(part.get("Content-Disposition") or "")
+        filename = part.get_filename()
+        if filename:
+            filename = _decode_header(filename)
+        ctype = part.get_content_type() or "application/octet-stream"
+        is_attachment = "attachment" in disp.lower()
+        is_inline_file = bool(filename) and ctype not in {
+            "text/plain",
+            "text/html",
+        }
+        if not (is_attachment or is_inline_file):
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        items.append(
+            InboundAttachment(
+                filename=filename or "attachment.bin",
+                content_type=ctype,
+                data=bytes(payload),
+            )
+        )
+    return tuple(items)
 
 
 def _require_imap(settings: Settings) -> None:
@@ -228,9 +265,34 @@ def _process_unseen(
                     body_text=_body_text(msg),
                     rfc_message_id=rfc_id,
                     provider_message_id=dedupe_provider_id,
+                    attachments=_extract_attachments(msg),
                 ),
                 file_store=file_store,
             )
+            attributed_case_id: str | None = None
+            if (
+                persisted.attribution_status == "unattributed"
+                and not persisted.duplicate
+            ):
+                from visa_agent.case_service.outreach import (
+                    try_auto_attribute_inbound_by_customer_email,
+                )
+
+                attributed_case_id = try_auto_attribute_inbound_by_customer_email(
+                    settings=settings,
+                    email_event_id=persisted.email_event_id,
+                    from_addr=from_addr,
+                )
+            if attributed_case_id and not persisted.duplicate:
+                from visa_agent.case_service.inbound_agent import (
+                    process_inbound_after_attribution,
+                )
+
+                process_inbound_after_attribution(
+                    settings=settings,
+                    case_id=attributed_case_id,
+                    email_event_id=persisted.email_event_id,
+                )
         except Exception as exc:  # noqa: BLE001
             # Leave UNSEEN so the next poll can retry this message.
             failures.append(

@@ -118,6 +118,9 @@ class DomainContractTests(unittest.TestCase):
             RequirementStatus.EXEMPTED_WITH_BASIS.value, "exempted_with_basis"
         )
         self.assertEqual(RouteCode.STANDARD_VISITOR.value, "standard_visitor")
+        self.assertEqual(RouteCode.STUDENT.value, "student")
+        self.assertEqual(RouteCode.SKILLED_WORKER.value, "skilled_worker")
+        self.assertEqual(RouteCode.GRADUATE.value, "graduate")
         self.assertNotEqual(
             DeliveryKind.FINAL_PACKAGE, DeliveryKind.PROGRESS_PACKAGE
         )

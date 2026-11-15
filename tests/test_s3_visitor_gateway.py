@@ -355,7 +355,7 @@ class ModelGatewayUnitTests(unittest.TestCase):
         )
         self.assertNotIn("曼彻斯特", body)
         self.assertNotIn("家人", body)
-        self.assertIn("intended_stay_days：14", body)
+        self.assertIn("计划停留天数：14 天", body)
         self.assertIn("请提供公司出具的在职证明", actions)
         expected = render_draft_from_grounded_facts(context=ctx, facts=facts)
         self.assertEqual((body, actions), expected)
@@ -368,7 +368,7 @@ class ModelGatewayUnitTests(unittest.TestCase):
         )
         self.assertNotIn("曼彻斯特", persisted.draft_text)
         self.assertNotIn("AcmeCorp", persisted.draft_text)
-        self.assertIn("intended_stay_days：14", persisted.draft_text)
+        self.assertIn("计划停留天数：14 天", persisted.draft_text)
         self.assertIn("请提供公司出具的在职证明", persisted.suggested_actions)
 
         import psycopg

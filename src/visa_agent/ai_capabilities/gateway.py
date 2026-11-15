@@ -48,6 +48,86 @@ _TEMPLATE_ACTIONS = (
     "1. 护照资料页\n2. 行程说明\n3. 资金摘要",
 )
 
+# Customer-facing labels — never show raw field keys in the email body.
+_FIELD_LABEL_ZH: dict[str, str] = {
+    "applicant_alias": "称呼",
+    "visit_purpose": "访问目的",
+    "intended_stay_days": "计划停留天数",
+    "funds_evidence": "资金材料",
+}
+
+_VALUE_LABEL_ZH: dict[str, str] = {
+    "SYN-DEMO-APPLICANT": "演示申请人",
+    "tourism_family_visit_demo": "探亲 / 旅游",
+    "synthetic_bank_summary_only_no_real_balances": (
+        "已收到银行摘要类材料（演示，不含真实余额）"
+    ),
+}
+
+
+def _friendly_fact_value(key: str, value: str) -> str:
+    mapped = _VALUE_LABEL_ZH.get(value)
+    if mapped:
+        return mapped
+    if key == "intended_stay_days":
+        return f"{value} 天"
+    # Soften leftover snake_case demo tokens without inventing new facts.
+    if re.fullmatch(r"[a-z0-9_]+", value) and "_" in value:
+        return value.replace("_", " ")
+    return value
+
+
+def format_customer_draft_from_facts(
+    facts: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> tuple[str, list[str]]:
+    """Plain Chinese confirmation note from grounded fact key/value pairs."""
+    grounded = {
+        str(f.get("key", "")).strip().lower(): str(f.get("value", "")).strip()
+        for f in facts
+        if str(f.get("key", "")).strip()
+    }
+    lines = [
+        "您好，",
+        "",
+        "根据我们目前核对过的信息，请您确认是否正确：",
+        "",
+    ]
+    preferred = (
+        "applicant_alias",
+        "visit_purpose",
+        "intended_stay_days",
+        "funds_evidence",
+    )
+    seen: set[str] = set()
+    for key in preferred:
+        if key not in grounded:
+            continue
+        label = _FIELD_LABEL_ZH.get(key, key)
+        lines.append(f"· {label}：{_friendly_fact_value(key, grounded[key])}")
+        seen.add(key)
+    for key, value in sorted(grounded.items()):
+        if key in seen:
+            continue
+        label = _FIELD_LABEL_ZH.get(key, key.replace("_", " "))
+        lines.append(f"· {label}：{_friendly_fact_value(key, value)}")
+    if not grounded:
+        lines.append("· 目前还没有可确认的信息，我们核对后再联系您。")
+    lines.extend(
+        [
+            "",
+            "如有出入请直接回复本邮件。",
+            "",
+            "说明：这只是进度核对，不是签证结果，也不是寄送回执。",
+        ]
+    )
+    actions = list(_TEMPLATE_ACTIONS)
+    if "intended_stay_days" in grounded:
+        days = _friendly_fact_value(
+            "intended_stay_days", grounded["intended_stay_days"]
+        )
+        actions.insert(0, f"请确认计划停留 {days} 是否仍然准确")
+    return "\n".join(lines), actions
+
 
 def _fact_map(context: SyntheticCaseContext) -> dict[str, str]:
     return {
@@ -116,46 +196,7 @@ def render_draft_from_grounded_facts(
     employers, or mutated quantities cannot be stored.
     """
     assert_facts_grounded(context=context, facts=facts)
-    grounded = {
-        str(f.get("key", "")).strip().lower(): str(f.get("value", "")).strip()
-        for f in facts
-        if str(f.get("key", "")).strip()
-    }
-    lines = [
-        "您好，以下正文仅复述已校验字段，未引入模型自由叙述中的其他事实。",
-    ]
-    # Stable field order for demo readability.
-    for key in (
-        "applicant_alias",
-        "visit_purpose",
-        "intended_stay_days",
-        "funds_evidence",
-    ):
-        if key in grounded:
-            if key == "intended_stay_days":
-                lines.append(f"已校验字段 intended_stay_days：{grounded[key]} 天。")
-            else:
-                lines.append(f"已校验字段 {key}：{grounded[key]}。")
-    for key, value in sorted(grounded.items()):
-        if key in {
-            "applicant_alias",
-            "visit_purpose",
-            "intended_stay_days",
-            "funds_evidence",
-        }:
-            continue
-        lines.append(f"已校验字段 {key}：{value}。")
-    if not grounded:
-        lines.append("当前无已校验候选事实；请人工核对后再联系客户。")
-    lines.append("本消息不构成批准、获签或材料寄出声明。")
-
-    actions = list(_TEMPLATE_ACTIONS)
-    if "intended_stay_days" in grounded:
-        actions.insert(
-            0,
-            f"请确认 intended_stay_days={grounded['intended_stay_days']} 是否仍准确",
-        )
-    return "\n".join(lines), actions
+    return format_customer_draft_from_facts(facts)
 
 
 def build_allowed_response_payload(

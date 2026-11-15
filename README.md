@@ -18,7 +18,7 @@
 | 规则容器 | `src/visa_agent/rules/` → `/rule-packs`、`/cases/{id}/requirements` |
 | 文档管线 | `src/visa_agent/document_pipeline/` → `/cases/{id}/evidence` |
 | 模型草稿 | `src/visa_agent/ai_capabilities/` → `POST /cases/{id}/draft` |
-| 工作台 | `GET /workbench` |
+| 工作台 | `GET /workbench`（案件）· `GET /workbench/inbox`（顾问提醒） |
 | HTTP | FastAPI：`visa_agent.fastapi_app` |
 | Postgres | `docker-compose.yml` → 宿主 `15432` |
 

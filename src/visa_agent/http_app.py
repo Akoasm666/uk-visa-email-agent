@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from visa_agent.config import Settings, get_settings
+from visa_agent.email_adapter.allowlist import effective_outbound_allowlist
 from visa_agent.storage import LocalFileStore, check_database
 
 
@@ -27,7 +28,7 @@ def build_health(settings: Settings) -> dict[str, Any]:
                 "configured": settings.email_configured,
                 "protocol": "smtp",
                 "from_addr": settings.email_from or None,
-                "allowlist_count": len(settings.outbound_allowlist),
+                "allowlist_count": len(effective_outbound_allowlist(settings)),
                 "imap_configured": settings.imap_configured,
             },
             "model": {

@@ -136,7 +136,9 @@ class DraftUnitTests(unittest.TestCase):
                 database_url=DB, tenant_id=TENANT, case_id=case.id
             )
         # Freeform model prose is discarded; only field-bound template is stored.
-        self.assertIn("已校验字段 visit_purpose", result.draft_text)
+        self.assertIn("访问目的", result.draft_text)
+        self.assertIn("探亲 / 旅游", result.draft_text)
+        self.assertNotIn("已校验字段", result.draft_text)
         self.assertNotIn("合成演示草稿", result.draft_text)
         self.assertEqual(result.case_version, before.case_version)
         self.assertEqual(after.status, before.status)
@@ -226,7 +228,8 @@ class DraftHttpTests(unittest.TestCase):
             resp = self.client.post(f"/cases/{case_id}/draft")
         self.assertEqual(resp.status_code, 200)
         data = resp.json()["data"]
-        self.assertIn("已校验字段 visit_purpose", data["draft_text"])
+        self.assertIn("访问目的", data["draft_text"])
+        self.assertNotIn("已校验字段", data["draft_text"])
         self.assertNotEqual(data["draft_text"], "Workbench draft body")
         self.assertTrue(data["model_call_id"])
 
@@ -247,9 +250,9 @@ class DraftHttpTests(unittest.TestCase):
         )
         page = self.client.get(f"/workbench/cases/{case_id}")
         self.assertEqual(page.status_code, 200)
-        self.assertIn("历史版本", page.text)
-        self.assertIn("draft_case_version=1", page.text)
-        self.assertIn("尚无模型草稿", page.text)
+        # Detail page only shows a draft for the current case version.
+        self.assertNotIn("给客户的邮件草稿", page.text)
+        self.assertNotIn("bound to v1", page.text)
 
     def test_poll_without_imap_returns_validation_error(self) -> None:
         resp = self.client.post("/internal/email/poll", json={"limit": 1})
