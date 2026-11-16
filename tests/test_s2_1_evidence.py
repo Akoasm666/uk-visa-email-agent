@@ -5,7 +5,9 @@ import tempfile
 import threading
 import unittest
 import uuid
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -13,9 +15,11 @@ from visa_agent.case_service import (
     attribute_inbound_to_case,
     create_case,
     get_case,
+    get_review_board,
     record_customer_confirmation,
     record_final_review,
 )
+from visa_agent.config import get_settings
 from visa_agent.document_pipeline import (
     attach_evidence,
     list_evidence,
@@ -26,7 +30,6 @@ from visa_agent.domain.enums import ErrorCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.email_adapter.inbound import InboundEmail, persist_inbound
 from visa_agent.storage.files import LocalFileStore
-from visa_agent.storage.migrate import apply_migrations
 
 DB = "postgresql://visa_agent:visa_agent_dev@127.0.0.1:15432/visa_agent"
 TENANT = "demo"
@@ -38,7 +41,13 @@ def _ver(case_id: str) -> int:
 
 class EvidencePipelineTests(unittest.TestCase):
     def setUp(self) -> None:
-        apply_migrations(DB)
+        from visa_agent import fastapi_app
+
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = replace(get_settings(root / ".env"), file_storage_dir=root)
+        self.enterContext(patch.object(fastapi_app, "get_settings", return_value=settings))
+        fastapi_app.bootstrap(settings)
+        self.client = TestClient(fastapi_app.app)
 
     def test_attach_isolates_original_without_mutating_bytes(self) -> None:
         case = create_case(
@@ -719,13 +728,6 @@ class EvidencePipelineTests(unittest.TestCase):
                 ),
                 0,
             )
-    def setUp(self) -> None:
-        apply_migrations(DB)
-        from visa_agent.fastapi_app import app, bootstrap
-
-        bootstrap()
-        self.client = TestClient(app)
-
     def test_api_attach_and_annotate(self) -> None:
         created = self.client.post(
             "/cases", json={"title": "api-ev", "customer_email": "x@y.com"}
@@ -796,13 +798,55 @@ class EvidencePipelineTests(unittest.TestCase):
         items = self.client.get(f"/cases/{case_id}/evidence").json()["data"]
         self.assertTrue(items)
         evidence_id = items[0]["evidence_id"]
+        detail_url = f"/workbench/cases/{case_id}"
+        file_url = f"{detail_url}/evidence/{evidence_id}/file"
+        self.assertNotIn(">已查看</span>", self.client.get(detail_url).text)
+        self.assertEqual(self.client.get(f"{file_url}?download=1").content, payload)
+        self.assertNotIn(">已查看</span>", self.client.get(detail_url).text)
+        version = _ver(case_id)
         view = self.client.get(
-            f"/workbench/cases/{case_id}/evidence/{evidence_id}/view"
+            f"{detail_url}/evidence/{evidence_id}/view"
         )
         self.assertEqual(view.status_code, 200)
         self.assertIn("passport.pdf", view.text)
-        raw = self.client.get(
-            f"/workbench/cases/{case_id}/evidence/{evidence_id}/file"
-        )
+        self.assertIn(">已查看</span>", self.client.get(detail_url).text)
+        self.assertEqual(_ver(case_id), version)
+        [evidence] = list_evidence(database_url=DB, tenant_id=TENANT, case_id=case_id)
+        self.assertIsNotNone(evidence.viewed_at)
+        self.assertEqual(evidence.quarantine_status, "isolated")
+        raw = self.client.get(file_url)
         self.assertEqual(raw.status_code, 200)
         self.assertEqual(raw.content, payload)
+
+    def test_workbench_delete_removes_material_and_invalidates_confirmation(self) -> None:
+        created = self.client.post("/cases", json={"title": "wb-delete"})
+        case_id = created.json()["data"]["case_id"]
+        path = f"/workbench/cases/{case_id}/evidence"
+        upload = dict(data={"classification": "passport", "expected_case_version": "1"},
+                      files={"file": ("delete-test.pdf", b"test document", "application/pdf")})
+        self.assertEqual(self.client.post(path, **upload, follow_redirects=False).status_code, 303)
+        items = self.client.get(f"/cases/{case_id}/evidence").json()["data"]
+        evidence_id = items[0]["evidence_id"]
+        old_version = _ver(case_id)
+        record_customer_confirmation(database_url=DB, tenant_id=TENANT, case_id=case_id,
+                                     expected_case_version=old_version)
+
+        stale = self.client.post(f"{path}/{evidence_id}/delete",
+                                 data={"expected_case_version": str(old_version - 1)})
+        self.assertIn("CONFLICT_VERSION", stale.text)
+        self.assertEqual(_ver(case_id), old_version)
+        self.assertEqual(self.client.get(f"{path}/{evidence_id}/file").status_code, 200)
+
+        result = self.client.post(f"{path}/{evidence_id}/delete",
+                                  data={"expected_case_version": str(old_version)})
+        self.assertIn("材料已从案件移除", result.text)
+        self.assertNotIn("delete-test.pdf", result.text)
+        self.assertEqual(_ver(case_id), old_version + 1)
+        self.assertEqual(self.client.get(f"{path}/{evidence_id}/file").status_code, 404)
+        self.assertEqual(self.client.get(f"/cases/{case_id}/evidence").json()["data"], [])
+        self.assertFalse(get_review_board(database_url=DB, tenant_id=TENANT,
+                                          case_id=case_id).customer_confirmation_effective)
+        upload["data"]["expected_case_version"] = str(_ver(case_id))
+        self.assertEqual(self.client.post(path, **upload, follow_redirects=False).status_code, 303)
+        new_id = self.client.get(f"/cases/{case_id}/evidence").json()["data"][0]["evidence_id"]
+        self.assertNotEqual(new_id, evidence_id)

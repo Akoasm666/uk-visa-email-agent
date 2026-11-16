@@ -1,4 +1,4 @@
-"""Outbound allowlist: static .env union dynamic DB entries (case emails)."""
+"""Outbound allowlist: static configuration and explicit authorization."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def list_db_allowlist(
         rows = conn.execute(
             """
             SELECT email FROM outbound_allowlist_entries
-            WHERE tenant_id = %s
+            WHERE tenant_id = %s AND source <> 'case_create'
             """,
             (tenant_id,),
         ).fetchall()
@@ -57,14 +57,14 @@ def add_outbound_allowlist_email(
     database_url: str,
     tenant_id: str,
     email: str,
-    source: str = "case_create",
+    source: str = "manual",
     case_id: str | None = None,
 ) -> str | None:
     """Insert customer email into DB allowlist. Returns normalized email or None."""
     norm = normalize_email(email)
     if not norm:
         return None
-    src = (source or "case_create").strip() or "case_create"
+    src = (source or "manual").strip() or "manual"
     with psycopg.connect(database_url) as conn:
         conn.execute(
             """
@@ -73,7 +73,7 @@ def add_outbound_allowlist_email(
             ) VALUES (%s, %s, %s, %s)
             ON CONFLICT (tenant_id, email) DO UPDATE
             SET case_id = COALESCE(EXCLUDED.case_id, outbound_allowlist_entries.case_id),
-                source = outbound_allowlist_entries.source
+                source = EXCLUDED.source
             """,
             (tenant_id, norm, src, case_id),
         )

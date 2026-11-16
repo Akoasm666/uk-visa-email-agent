@@ -153,9 +153,10 @@ def assemble_package(
                 rows = conn.execute(
                     """
                     SELECT id, file_id, content_sha256, original_filename,
-                           classification, byte_size, quarantine_status
+                           classification, byte_size, quarantine_status,
+                           advisor_reviewed_version = case_version AS advisor_reviewed
                     FROM case_evidence
-                    WHERE tenant_id = %s AND case_id = %s AND id = ANY(%s)
+                    WHERE tenant_id = %s AND case_id = %s AND id = ANY(%s) AND deleted_at IS NULL
                     ORDER BY created_at ASC, id ASC
                     """,
                     (tenant_id, case_id, wanted),
@@ -172,9 +173,11 @@ def assemble_package(
                 rows = conn.execute(
                     """
                     SELECT id, file_id, content_sha256, original_filename,
-                           classification, byte_size, quarantine_status
+                           classification, byte_size, quarantine_status,
+                           advisor_reviewed_version = case_version AS advisor_reviewed
                     FROM case_evidence
-                    WHERE tenant_id = %s AND case_id = %s
+                    WHERE tenant_id = %s AND case_id = %s AND deleted_at IS NULL
+                      AND classification <> 'translation_draft'
                     ORDER BY created_at ASC, id ASC
                     """,
                     (tenant_id, case_id),
@@ -182,7 +185,10 @@ def assemble_package(
 
             items: list[ManifestItem] = []
             for r in rows:
-                if (r[6] or "") != _ACCEPTED:
+                if r[4] == "translation_draft":
+                    raise DomainError(ErrorCode.VALIDATION_ERROR, "unreviewed translation draft cannot enter a package")
+                reviewed_itinerary = r[4] == "itinerary" and r[6] == "isolated" and r[7]
+                if r[6] != _ACCEPTED and not reviewed_itinerary:
                     raise DomainError(
                         code=ErrorCode.VALIDATION_ERROR,
                         message="only accepted_for_review evidence may enter a package",

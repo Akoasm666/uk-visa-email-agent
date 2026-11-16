@@ -667,6 +667,16 @@ class OutboxGateIntegrationTests(unittest.TestCase):
             self.assertTrue(second.resent_blocked)
             self.assertEqual(calls["n"], 1)
 
+    def test_smtp_disconnect_before_envelope_is_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = get_settings(_base_env(Path(tmp), allowlist="customer@example.com"))
+            with patch("visa_agent.email_adapter.smtp_client.smtplib.SMTP") as smtp:
+                session = smtp.return_value.__enter__.return_value
+                session.starttls.side_effect = SMTPServerDisconnected("TLS connection closed")
+                with self.assertRaises(SendRejectedError):
+                    send_smtp(settings, recipients=["customer@example.com"], subject="Notice", body_text="Hello")
+                session.send_message.assert_not_called()
+
     def test_outbox_disconnect_via_real_smtp_types_blocks_resend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env = _base_env(Path(tmp), allowlist="c-baron-app@hotmail.com")

@@ -5,21 +5,23 @@ from __future__ import annotations
 import tempfile
 import unittest
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import unquote
 
+import psycopg
 from fastapi.testclient import TestClient
 
+from visa_agent.case_service.material_confirmation import resume_material_confirmations
 from visa_agent.case_service.outreach import (
     build_opening_email,
     send_opening_outreach,
 )
 from visa_agent.case_service.service import create_case, get_case
-from visa_agent.config import Settings
-from visa_agent.domain.enums import RouteCode
+from visa_agent.config import Settings, get_settings
+from visa_agent.domain.enums import CaseStatus, RouteCode
 from visa_agent.email_adapter.outbox import OutboxResult
-from visa_agent.storage.migrate import apply_migrations
 
 DB = "postgresql://visa_agent:visa_agent_dev@127.0.0.1:15432/visa_agent"
 TENANT = "demo"
@@ -51,11 +53,13 @@ def _settings(*, allowlist: frozenset[str] | None = None) -> Settings:
 
 class OpeningOutreachTests(unittest.TestCase):
     def setUp(self) -> None:
-        apply_migrations(DB)
-        from visa_agent.fastapi_app import app, bootstrap
+        from visa_agent import fastapi_app
 
-        bootstrap()
-        self.client = TestClient(app)
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = replace(get_settings(root / ".env"), file_storage_dir=root)
+        self.enterContext(patch.object(fastapi_app, "get_settings", return_value=settings))
+        fastapi_app.bootstrap(settings)
+        self.client = TestClient(fastapi_app.app)
 
     def test_opening_email_is_human_readable(self) -> None:
         case = create_case(
@@ -104,6 +108,22 @@ class OpeningOutreachTests(unittest.TestCase):
         self.assertTrue(result.sent)
         after = get_case(database_url=DB, tenant_id=TENANT, case_id=case.id)
         self.assertTrue(after.waiting_customer)
+        self.assertEqual(after.status, CaseStatus.COLLECT_AND_VERIFY)
+
+    def test_legacy_opened_case_advances_without_another_email_or_button(self) -> None:
+        address = f"old-opening-{uuid.uuid4().hex[:8]}@example.com"
+        settings = _settings(allowlist=frozenset({address}))
+        keys = dict(database_url=DB, tenant_id=TENANT)
+        case = create_case(**keys, customer_email=address)
+        with patch("visa_agent.email_adapter.outbox.send_smtp", return_value="250 ok") as smtp:
+            resume_material_confirmations(settings)
+            self.assertEqual(get_case(**keys, case_id=case.id).status, CaseStatus.LEAD)
+            self.assertTrue(send_opening_outreach(settings=settings, case=case).sent)
+            with psycopg.connect(DB) as conn:
+                conn.execute("UPDATE cases SET status = 'lead' WHERE tenant_id = %s AND id = %s", (TENANT, case.id))
+            resume_material_confirmations(settings)
+            smtp.assert_called_once()
+        self.assertEqual(get_case(**keys, case_id=case.id).status, CaseStatus.COLLECT_AND_VERIFY)
 
     def test_workbench_create_requires_email_and_triggers_outreach(self) -> None:
         missing = self.client.post(

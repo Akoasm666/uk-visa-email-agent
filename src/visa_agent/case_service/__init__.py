@@ -1,8 +1,3 @@
-from visa_agent.case_service.inbound_agent import (
-    InboundProcessResult,
-    process_customer_inbound,
-    process_inbound_after_attribution,
-)
 from visa_agent.case_service.remediation import (
     AdvisorAlert,
     OpenQuestion,
@@ -40,6 +35,16 @@ from visa_agent.case_service.service import (
     set_case_route,
     set_takeover,
 )
+
+
+def __getattr__(name: str):
+    # The inbox uses document services, which also import case versioning.
+    if name in {"InboundProcessResult", "process_customer_inbound", "process_inbound_after_attribution"}:
+        from visa_agent.case_service import inbound_agent
+
+        return getattr(inbound_agent, name)
+    raise AttributeError(name)
+
 
 __all__ = [
     "CaseRecord",

@@ -55,6 +55,7 @@ class OutboundMessageKind(StrEnum):
     """Outbound traffic kinds — final packages use stricter approval binding."""
 
     ORDINARY_REPLY = "ordinary_reply"
+    CASE_CLOSURE_NOTICE = "case_closure_notice"
     PROGRESS_PACKAGE = "progress_package"
     FINAL_PACKAGE = "final_package"
 

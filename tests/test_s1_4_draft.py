@@ -16,7 +16,7 @@ from visa_agent.ai_capabilities.draft import (
 )
 from visa_agent.case_service import create_case, get_case
 from visa_agent.case_service.service import bump_case_version
-from visa_agent.config import get_settings
+from visa_agent.config import Settings, get_settings
 from visa_agent.domain.enums import ErrorCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.storage.migrate import apply_migrations
@@ -25,7 +25,7 @@ DB = "postgresql://visa_agent:visa_agent_dev@127.0.0.1:15432/visa_agent"
 TENANT = "demo"
 
 
-def _settings(tmp: Path) -> object:
+def _settings(tmp: Path) -> Settings:
     env = tmp / ".env"
     env.write_text(
         "\n".join(
@@ -205,11 +205,14 @@ class DraftUnitTests(unittest.TestCase):
 
 class DraftHttpTests(unittest.TestCase):
     def setUp(self) -> None:
-        apply_migrations(DB)
-        from visa_agent.fastapi_app import app, bootstrap
+        from visa_agent import fastapi_app
 
-        bootstrap()
-        self.client = TestClient(app)
+        settings = _settings(Path(self.enterContext(tempfile.TemporaryDirectory())))
+        self.enterContext(
+            unittest.mock.patch.object(fastapi_app, "get_settings", return_value=settings)
+        )
+        fastapi_app.bootstrap(settings)
+        self.client = TestClient(fastapi_app.app)
 
     def test_api_draft_uses_injectable_path_via_patch(self) -> None:
         created = self.client.post(

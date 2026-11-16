@@ -49,8 +49,9 @@ class WebResearchTests(unittest.TestCase):
                 source="duckduckgo",
             ),
         )
-        conf = score_research_confidence(hits)
+        conf = score_research_confidence(hits, question="How do I show my funds?")
         self.assertGreaterEqual(conf, 0.62)
+        self.assertEqual(score_research_confidence(hits, question="How long is the processing time?"), 0.0)
 
     def test_gather_merges_ukvi_and_web(self) -> None:
         bundle = gather_research(

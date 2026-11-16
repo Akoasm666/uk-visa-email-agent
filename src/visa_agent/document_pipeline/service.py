@@ -10,6 +10,7 @@ import hashlib
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import psycopg
@@ -21,7 +22,7 @@ from visa_agent.case_service.service import (
     get_case,
 )
 from visa_agent.document_pipeline.ocr import OcrProvider, default_ocr_provider
-from visa_agent.domain.enums import ErrorCode
+from visa_agent.domain.enums import CaseStatus, ErrorCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.storage.files import LocalFileStore
 
@@ -79,6 +80,9 @@ class EvidenceRecord:
     quarantine_status: str
     rejection_reason: str
     source_email_event_id: str | None
+    viewed_at: datetime | None = None
+    advisor_reviewed_version: int | None = None
+    translation_source_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +146,9 @@ def _row_to_evidence(row: tuple) -> EvidenceRecord:
         quarantine_status=row[10] or "isolated",
         rejection_reason=row[11] or "",
         source_email_event_id=row[12],
+        viewed_at=row[13],
+        advisor_reviewed_version=row[14],
+        translation_source_id=row[15],
     )
 
 
@@ -202,6 +209,8 @@ def attach_evidence(
     classification: str = "unclassified",
     source_email_event_id: str | None = None,
     expected_case_version: int | None = None,
+    reuse_same_source: bool = False,
+    translation_draft_id: str | None = None,
 ) -> EvidenceRecord:
     """Store original bytes immutably and create a quarantined evidence row.
 
@@ -232,6 +241,8 @@ def attach_evidence(
         label = "unclassified"
 
     ext = _ext(filename) or ".bin"
+    if translation_draft_id and (label != "translation" or ext != ".pdf" or not data.startswith(b"%PDF-")):
+        raise DomainError(ErrorCode.VALIDATION_ERROR, "请上传 PDF 译文")
     evidence_id = uuid.uuid4().hex
     created_new = False
     orphan_path: Path | None = None
@@ -248,6 +259,18 @@ def attach_evidence(
                     for_update=True,
                 )
                 _require_version(case, expected_case_version, required=True)
+                translation_source_id = None
+                if translation_draft_id:
+                    if case.status in {CaseStatus.CLOSED, CaseStatus.DELIVERED, CaseStatus.SENT_AWAITING_ACK}:
+                        raise DomainError(ErrorCode.VALIDATION_ERROR, "已发送或结束的案件仅可查看")
+                    draft = get_evidence(
+                        database_url=database_url, tenant_id=tenant_id, case_id=case_id,
+                        evidence_id=translation_draft_id, conn=conn,
+                    )
+                    if (draft.classification != "translation_draft" or not draft.translation_source_id
+                            or draft.quarantine_status == "rejected"):
+                        raise DomainError(ErrorCode.VALIDATION_ERROR, "请选择有效的译文草稿")
+                    translation_source_id = draft.translation_source_id
 
                 if source_email_event_id:
                     _require_attributed_inbound(
@@ -259,12 +282,23 @@ def attach_evidence(
 
                 dup = conn.execute(
                     """
-                    SELECT id FROM case_evidence
+                    SELECT id, source_email_event_id, deleted_at FROM case_evidence
                     WHERE tenant_id = %s AND case_id = %s AND content_sha256 = %s
+                      AND (deleted_at IS NULL OR source_email_event_id = %s)
+                    ORDER BY deleted_at NULLS FIRST
+                    LIMIT 1
                     """,
-                    (tenant_id, case_id, digest),
+                    (tenant_id, case_id, digest, source_email_event_id),
                 ).fetchone()
                 if dup is not None:
+                    if reuse_same_source and source_email_event_id and dup[1] == source_email_event_id and dup[2] is None:
+                        return get_evidence(
+                            database_url=database_url,
+                            tenant_id=tenant_id,
+                            case_id=case_id,
+                            evidence_id=dup[0],
+                            conn=conn,
+                        )
                     raise DomainError(
                         code=ErrorCode.ATTACHMENT_REJECTED,
                         message=(
@@ -295,18 +329,23 @@ def attach_evidence(
                 _barrier("after_file_write")
 
                 try:
+                    if translation_draft_id:
+                        conn.execute(
+                            "UPDATE case_evidence SET deleted_at = NOW() WHERE id = %s AND tenant_id = %s AND case_id = %s",
+                            (translation_draft_id, tenant_id, case_id),
+                        )
                     conn.execute(
                         """
                         INSERT INTO case_evidence (
                             id, tenant_id, case_id, case_version, file_id,
                             content_sha256, original_filename, content_type,
                             byte_size, classification, quarantine_status,
-                            rejection_reason, source_email_event_id
+                            rejection_reason, source_email_event_id, translation_source_id
                         ) VALUES (
                             %s, %s, %s, %s, %s,
                             %s, %s, %s,
                             %s, %s, %s,
-                            %s, %s
+                            %s, %s, %s
                         )
                         """,
                         (
@@ -323,6 +362,7 @@ def attach_evidence(
                             quarantine,
                             rejection,
                             source_email_event_id,
+                            translation_source_id,
                         ),
                     )
                 except UniqueViolation as exc:
@@ -383,28 +423,35 @@ def set_evidence_classification(
     case_id: str,
     evidence_id: str,
     classification: str,
+    document_language: str | None = None,
 ) -> EvidenceRecord:
-    """Update checklist slot label after OCR/filename classify (no version bump)."""
+    """Update the checklist slot and invalidate snapshots when the class changes."""
     label = (classification or "unclassified").strip() or "unclassified"
     if label.lower() in {"fuzzy", "unclear", "unknown"}:
         label = "unclassified"
     with psycopg.connect(database_url) as conn:
-        row = conn.execute(
+        keys = dict(database_url=database_url, tenant_id=tenant_id, case_id=case_id)
+        case = get_case(**keys, conn=conn, for_update=True)
+        evidence = get_evidence(**keys, evidence_id=evidence_id, conn=conn)
+        recorded_language = conn.execute(
+            "SELECT document_language FROM case_evidence WHERE tenant_id = %s AND case_id = %s AND id = %s",
+            (tenant_id, case_id, evidence_id),
+        ).fetchone()[0]
+        language = document_language if document_language in {"english", "welsh", "other"} else recorded_language
+        if evidence.classification == label and language == recorded_language:
+            return evidence
+        if evidence.classification == "translation_draft" or evidence.translation_source_id:
+            raise DomainError(ErrorCode.VALIDATION_ERROR, "请在材料清单里核对或替换译文")
+        updated = bump_case_version_in_conn(**keys, conn=conn, expected_case_version=case.case_version)
+        conn.execute(
             """
             UPDATE case_evidence
-            SET classification = %s
+            SET classification = %s, case_version = %s, document_language = %s
             WHERE tenant_id = %s AND case_id = %s AND id = %s
-            RETURNING id
+              AND deleted_at IS NULL
             """,
-            (label, tenant_id, case_id, evidence_id),
-        ).fetchone()
-        if row is None:
-            raise DomainError(
-                code=ErrorCode.NOT_FOUND,
-                message="evidence not found",
-                details=(evidence_id,),
-            )
-        conn.commit()
+            (label, updated.case_version, language, tenant_id, case_id, evidence_id),
+        )
     return get_evidence(
         database_url=database_url,
         tenant_id=tenant_id,
@@ -424,9 +471,11 @@ def get_evidence(
     sql = """
         SELECT id, tenant_id, case_id, case_version, file_id, content_sha256,
                original_filename, content_type, byte_size, classification,
-               quarantine_status, rejection_reason, source_email_event_id
+               quarantine_status, rejection_reason, source_email_event_id, viewed_at,
+               advisor_reviewed_version, translation_source_id
         FROM case_evidence
         WHERE tenant_id = %s AND case_id = %s AND id = %s
+          AND deleted_at IS NULL
     """
 
     def _fetch(c: psycopg.Connection) -> EvidenceRecord:
@@ -456,14 +505,116 @@ def list_evidence(
             """
             SELECT id, tenant_id, case_id, case_version, file_id, content_sha256,
                    original_filename, content_type, byte_size, classification,
-                   quarantine_status, rejection_reason, source_email_event_id
+                   quarantine_status, rejection_reason, source_email_event_id, viewed_at,
+                   advisor_reviewed_version, translation_source_id
             FROM case_evidence
             WHERE tenant_id = %s AND case_id = %s
+              AND deleted_at IS NULL
             ORDER BY created_at DESC
             """,
             (tenant_id, case_id),
         ).fetchall()
     return [_row_to_evidence(r) for r in rows]
+
+
+def mark_evidence_viewed(
+    *, database_url: str, tenant_id: str, case_id: str, evidence_id: str,
+) -> None:
+    """Remember the first preview independently of the material and case version."""
+    with psycopg.connect(database_url) as conn:
+        conn.execute(
+            """
+            UPDATE case_evidence SET viewed_at = NOW()
+            WHERE tenant_id = %s AND case_id = %s AND id = %s
+              AND viewed_at IS NULL AND deleted_at IS NULL AND quarantine_status <> 'rejected'
+            """,
+            (tenant_id, case_id, evidence_id),
+        )
+
+
+def delete_evidence(
+    *, database_url: str, tenant_id: str, case_id: str, evidence_id: str,
+    expected_case_version: int | None,
+) -> None:
+    """Remove the file from active case use and invalidate approvals atomically."""
+    keys = dict(database_url=database_url, tenant_id=tenant_id, case_id=case_id)
+    with psycopg.connect(database_url) as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                     (f"customer-inbound:{tenant_id}:{case_id}",))
+        case = get_case(**keys, conn=conn, for_update=True)
+        _require_version(case, expected_case_version, required=True)
+        if case.status in {CaseStatus.CLOSED, CaseStatus.DELIVERED, CaseStatus.SENT_AWAITING_ACK}:
+            raise DomainError(ErrorCode.VALIDATION_ERROR, "已发送或关闭的案件不能删除材料")
+        busy = conn.execute(
+            """
+            SELECT 1 FROM outbox_messages
+            WHERE tenant_id = %s AND case_id = %s AND status = 'processing'
+            LIMIT 1
+            """,
+            (tenant_id, case_id),
+        ).fetchone()
+        if busy:
+            raise DomainError(ErrorCode.CONFLICT_VERSION, "案件正在发信，请稍后再删除材料")
+        removed = conn.execute(
+            """
+            UPDATE case_evidence SET deleted_at = NOW()
+            WHERE tenant_id = %s AND case_id = %s AND id = %s AND deleted_at IS NULL
+            RETURNING id
+            """,
+            (tenant_id, case_id, evidence_id),
+        ).fetchone()
+        if removed is None:
+            raise DomainError(ErrorCode.NOT_FOUND, "材料已删除或不存在")
+        conn.execute(
+            """
+            UPDATE case_evidence SET deleted_at = NOW()
+            WHERE tenant_id = %s AND case_id = %s AND translation_source_id = %s AND deleted_at IS NULL
+            """,
+            (tenant_id, case_id, evidence_id),
+        )
+        conn.execute(
+            """
+            UPDATE case_itinerary_requests
+            SET draft_text = '', draft_evidence_id = NULL, draft_message_id = NULL,
+                draft_source_email_event_id = NULL, confirmed_at = NULL,
+                last_reply_text = '', awaiting_details = FALSE
+            WHERE tenant_id = %s AND case_id = %s AND draft_evidence_id = %s
+            """,
+            (tenant_id, case_id, evidence_id),
+        )
+        updated = bump_case_version_in_conn(
+            **keys, conn=conn, expected_case_version=case.case_version, required=True,
+        )
+        conn.execute(
+            """
+            UPDATE open_questions SET status = 'closed', closed_at = NOW(), updated_at = NOW()
+            WHERE tenant_id = %s AND case_id = %s AND evidence_id = %s
+              AND requirement_key = 'advisor_unclassified' AND status = 'escalated_human'
+            """,
+            (tenant_id, case_id, evidence_id),
+        )
+        conn.execute(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (requirement_key) id
+                FROM open_questions WHERE tenant_id = %s AND case_id = %s
+                ORDER BY requirement_key, created_at DESC, id DESC
+            )
+            UPDATE open_questions AS q
+            SET status = CASE WHEN q.severity = 'complex_human'
+                THEN 'escalated_human' ELSE 'waiting_customer' END,
+                closed_by_evidence_id = NULL, closed_at = NULL, updated_at = NOW(),
+                case_version = %s
+            FROM latest WHERE q.id = latest.id AND q.status = 'closed'
+              AND q.closed_by_evidence_id = %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM open_questions active
+                  WHERE active.tenant_id = q.tenant_id AND active.case_id = q.case_id
+                    AND active.requirement_key = q.requirement_key AND active.status <> 'closed'
+              )
+            """,
+            (tenant_id, case_id, updated.case_version, evidence_id),
+        )
 
 
 def set_evidence_quarantine(
@@ -509,6 +660,8 @@ def set_evidence_quarantine(
                         evidence.rejection_reason or "hard reject",
                     ),
                 )
+            if evidence.classification == "translation_draft" and quarantine_status == "accepted_for_review":
+                raise DomainError(ErrorCode.VALIDATION_ERROR, "请在材料清单里核对译文")
 
             bumped = bump_case_version_in_conn(
                 conn=conn,
@@ -652,6 +805,7 @@ def list_annotations(
                        field_key, field_value, note
                 FROM evidence_annotations
                 WHERE tenant_id = %s AND case_id = %s AND evidence_id = %s
+                  AND evidence_id IN (SELECT id FROM case_evidence WHERE deleted_at IS NULL)
                 ORDER BY created_at DESC
                 """,
                 (tenant_id, case_id, evidence_id),
@@ -663,6 +817,7 @@ def list_annotations(
                        field_key, field_value, note
                 FROM evidence_annotations
                 WHERE tenant_id = %s AND case_id = %s
+                  AND evidence_id IN (SELECT id FROM case_evidence WHERE deleted_at IS NULL)
                 ORDER BY created_at DESC
                 """,
                 (tenant_id, case_id),
@@ -826,6 +981,7 @@ def get_ocr_result(
                    provider, status, extracted_text, source_content_sha256, detail
             FROM evidence_ocr_results
             WHERE tenant_id = %s AND case_id = %s AND id = %s
+              AND evidence_id IN (SELECT id FROM case_evidence WHERE deleted_at IS NULL)
             """,
             (tenant_id, case_id, ocr_id),
         ).fetchone()
@@ -853,6 +1009,7 @@ def list_ocr_results(
                        provider, status, extracted_text, source_content_sha256, detail
                 FROM evidence_ocr_results
                 WHERE tenant_id = %s AND case_id = %s AND evidence_id = %s
+                  AND evidence_id IN (SELECT id FROM case_evidence WHERE deleted_at IS NULL)
                 ORDER BY created_at DESC
                 """,
                 (tenant_id, case_id, evidence_id),
@@ -864,6 +1021,7 @@ def list_ocr_results(
                        provider, status, extracted_text, source_content_sha256, detail
                 FROM evidence_ocr_results
                 WHERE tenant_id = %s AND case_id = %s
+                  AND evidence_id IN (SELECT id FROM case_evidence WHERE deleted_at IS NULL)
                 ORDER BY created_at DESC
                 """,
                 (tenant_id, case_id),

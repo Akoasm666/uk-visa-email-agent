@@ -23,6 +23,7 @@ from visa_agent.case_service import (
 )
 from visa_agent.case_service.service import bump_case_version
 from visa_agent.config import Settings
+from visa_agent.domain.enums import CaseStatus
 from visa_agent.storage.migrate import apply_migrations
 
 TENANT = "demo"
@@ -364,9 +365,11 @@ class ReviewBoardApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._patcher.stop()
 
-    def test_api_and_workbench_mark_stale_and_reject_summary(self) -> None:
-        created = self.client.post("/cases", json={"title": "rb-api"})
-        case_id = created.json()["data"]["case_id"]
+    def test_api_keeps_history_and_workbench_shows_current_reject(self) -> None:
+        case = create_case(
+            database_url=TEST_DB, tenant_id=TENANT, title="rb-api", status=CaseStatus.FINAL_REVIEW,
+        )
+        case_id = case.id
         self.client.post(
             f"/cases/{case_id}/confirm",
             json={"expected_case_version": 1},
@@ -404,9 +407,9 @@ class ReviewBoardApiTests(unittest.TestCase):
         page = self.client.get(f"/workbench/cases/{case_id}")
         self.assertEqual(page.status_code, 200)
         html = page.text
-        self.assertIn("已驳回", html)
-        self.assertIn("当前版本 · 驳回", html)
-        self.assertIn("v2", html)
+        self.assertIn("终审已驳回，需修改", html)
+        self.assertNotIn("确认与终审记录", html)
+        self.assertNotIn("案件维护", html)
 
         # Re-approve keeps reject history.
         self.client.post(

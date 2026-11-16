@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import psycopg
 
 from visa_agent.case_service.service import (
@@ -87,9 +89,10 @@ def apply_transition(
     case_id: str,
     target: CaseStatus,
     expected_case_version: int | None = None,
+    conn: psycopg.Connection | None = None,
 ) -> CaseRecord:
     """Validate and persist transition atomically (status + version + delivery)."""
-    with psycopg.connect(database_url) as conn:
+    with (nullcontext(conn) if conn is not None else psycopg.connect(database_url)) as conn:
         with conn.transaction():
             case = get_case(
                 database_url=database_url,

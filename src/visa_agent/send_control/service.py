@@ -12,7 +12,7 @@ import psycopg
 from visa_agent.case_service.service import get_case
 from visa_agent.config import Settings
 from visa_agent.delivery.service import get_package, verify_package_bytes
-from visa_agent.domain.enums import CaseStatus, DeliveryKind, ErrorCode, OutboundMessageKind
+from visa_agent.domain.enums import CaseStatus, DeliveryKind, ErrorCode, OutboundMessageKind, RequirementStatus
 from visa_agent.domain.errors import DomainError
 from visa_agent.domain.models import FinalPackageApproval, OutboundGateInput, evaluate_outbound_gate
 from visa_agent.email_adapter.allowlist import effective_outbound_allowlist
@@ -22,7 +22,9 @@ from visa_agent.email_adapter.errors import (
 )
 from visa_agent.email_adapter.outbox import OutboxResult, build_send_operation_id
 from visa_agent.email_adapter.smtp_client import send_smtp
+from visa_agent.email_adapter.threading import case_message_id
 from visa_agent.storage.files import LocalFileStore
+from visa_agent.workflow.transitions import apply_transition
 
 _NO_RESEND_STATUSES = frozenset(
     {
@@ -282,6 +284,45 @@ def _evaluate_gates(
         has_confirmation=has_conf,
         has_unprocessed_inbound=unprocessed,
     )
+    if package_kind == DeliveryKind.FINAL_PACKAGE.value:
+        from visa_agent.rules.service import evaluate_case_requirements
+
+        keys = dict(database_url=settings.database_url, tenant_id=settings.tenant_id, case_id=case_id,
+                    conn=conn, preview_unbound=True, persist_states=False)
+        try:
+            case_requirements = evaluate_case_requirements(**keys)
+            package_requirements = evaluate_case_requirements(
+                **keys, package_evidence_ids=tuple(item.evidence_id for item in package.items),
+            )
+        except DomainError as exc:
+            if exc.code not in {ErrorCode.NOT_FOUND, ErrorCode.VALIDATION_ERROR}:
+                raise
+            readiness.append("FINAL_PACKAGE_REQUIREMENTS_UNVERIFIED")
+        else:
+            blockers = {}
+            for evaluation in (case_requirements, package_requirements):
+                for state in evaluation.states:
+                    key = state.requirement_key
+                    if key not in evaluation.blocking_keys:
+                        continue
+                    # A customer declaration is evaluated against the confirmed case
+                    # and package review. It need not be duplicated as an attachment.
+                    if (has_conf and approval and key == "visit_purpose_allowed"
+                            and state.status == RequirementStatus.RECEIVED_PENDING_REVIEW
+                            and state.reason.endswith("（来自客户邮件）")):
+                        continue
+                    if (approval and state.severity == "transfer_human"
+                            and state.status == RequirementStatus.APPLICABILITY_UNKNOWN):
+                        continue
+                    blockers[key] = None
+            readiness.extend(f"FINAL_PACKAGE_REQUIREMENT_BLOCKED:{key}" for key in blockers)
+        if conn.execute(
+            """
+            SELECT 1 FROM open_questions WHERE tenant_id = %s AND case_id = %s
+              AND status IN ('open', 'waiting_customer', 'escalated_human') LIMIT 1
+            """, (settings.tenant_id, case_id),
+        ).fetchone():
+            readiness.append("FINAL_PACKAGE_OPEN_QUESTIONS")
 
     gate = OutboundGateInput(
         kind=kind,
@@ -678,17 +719,19 @@ def send_case_package(
 
             attachments = verify_package_bytes(file_store=store, package=package)
 
+            message_id = case_message_id(outbox_id, settings.email_from)
             claimed = conn.execute(
                 """
                 UPDATE outbox_messages
                 SET status = 'processing',
+                    rfc_message_id = %s,
                     block_reasons = '[]'::jsonb,
                     updated_at = NOW()
                 WHERE id = %s
                   AND status IN ('pending', 'failed', 'blocked')
                 RETURNING id
                 """,
-                (outbox_id,),
+                (message_id, outbox_id),
             ).fetchone()
             if claimed is None:
                 row = conn.execute(
@@ -718,6 +761,7 @@ def send_case_package(
                 subject=subject,
                 body_text=body,
                 attachments=atts,
+                message_id=message_id,
             )
 
         dispatcher = _smtp_dispatch
@@ -866,7 +910,7 @@ def send_case_package(
     try:
         with psycopg.connect(settings.database_url) as conn:
             with conn.transaction():
-                get_case(
+                case = get_case(
                     database_url=settings.database_url,
                     tenant_id=settings.tenant_id,
                     case_id=case_id,
@@ -905,11 +949,11 @@ def send_case_package(
                     INSERT INTO email_events (
                         id, tenant_id, direction, provider_message_id,
                         dedupe_key, from_addr, to_addrs, subject, body_text,
-                        case_id, attribution_status, processing_status
+                        case_id, attribution_status, processing_status, rfc_message_id
                     ) VALUES (
                         %s, %s, 'outbound', %s,
                         %s, %s, %s::jsonb, %s, %s,
-                        %s, 'attributed', 'processed'
+                        %s, 'attributed', 'processed', %s
                     )
                     """,
                     (
@@ -922,6 +966,7 @@ def send_case_package(
                         frozen_subject,
                         frozen_body,
                         case_id,
+                        message_id,
                     ),
                 )
                 _link_case_delivery(
@@ -945,6 +990,20 @@ def send_case_package(
                     """,
                     (provider_response, email_event_id, outbox_id),
                 )
+                if (
+                    claim_package_kind == DeliveryKind.FINAL_PACKAGE.value
+                    and case.case_version == claim_case_version
+                    and case.status == CaseStatus.READY_TO_DELIVER
+                ):
+                    apply_transition(
+                        database_url=settings.database_url, tenant_id=settings.tenant_id,
+                        case_id=case_id, target=CaseStatus.SENT_AWAITING_ACK,
+                        expected_case_version=claim_case_version, conn=conn,
+                    )
+                    conn.execute(
+                        "UPDATE cases SET waiting_customer = TRUE WHERE tenant_id = %s AND id = %s",
+                        (settings.tenant_id, case_id),
+                    )
         return OutboxResult(
             outbox_id=outbox_id,
             status="provider_accepted",

@@ -46,6 +46,21 @@ class AdvisorAlert:
     updated_sort: str
 
 
+@dataclass(frozen=True, slots=True)
+class UnassignedMail:
+    id: str
+    sender: str
+    subject: str
+    body_text: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AdvisorInbox:
+    alerts: list[AdvisorAlert]
+    unassigned_mail: list[UnassignedMail]
+    pending_count: int
+
+
 def _row(row: tuple) -> OpenQuestion:
     return OpenQuestion(
         id=row[0],
@@ -200,78 +215,115 @@ def open_remediation(
     return _row(row)
 
 
+_INBOX_ITEMS = """
+WITH inbox_items (
+    kind, item_id, case_id, title, email, case_status, route, requirement_key,
+    reason_code, reason_detail, updated_at
+) AS (
+    SELECT 'question', q.id, c.id, c.title, c.customer_email, c.status, c.route,
+           q.requirement_key, q.reason_code, q.reason_detail, q.updated_at
+    FROM open_questions q
+    JOIN cases c ON c.id = q.case_id AND c.tenant_id = q.tenant_id
+    WHERE q.tenant_id = %s AND q.status = 'escalated_human'
+      AND c.status NOT IN ('closed', 'delivered')
+    UNION ALL
+    SELECT 'takeover', c.id, c.id, c.title, c.customer_email, c.status, c.route,
+           '', 'human_takeover', '案件已标记为人工接管', c.updated_at
+    FROM cases c
+    WHERE c.tenant_id = %s AND c.human_takeover
+      AND c.status NOT IN ('closed', 'delivered')
+    UNION ALL
+    SELECT 'mail', id, NULL, subject, from_addr, NULL, NULL, '', '', '', created_at
+    FROM email_events
+    WHERE tenant_id = %s AND direction = 'inbound'
+      AND attribution_status = 'unattributed' AND case_id IS NULL
+)
+"""
+
+
+def _advisor_alert(row: tuple) -> AdvisorAlert:
+    kind, item_id, case_id, title, email, status, route, key, code, detail, updated = row
+    return AdvisorAlert(
+        question_id=item_id if kind == "question" else "",
+        case_id=case_id,
+        case_title=title or "",
+        customer_email=email or "",
+        case_status=status,
+        route=route,
+        requirement_key=key,
+        reason_code=code,
+        reason_detail=detail,
+        alert_kind="escalate_question" if kind == "question" else "human_takeover",
+        updated_sort=updated.isoformat(),
+    )
+
+
 def list_advisor_alerts(
-    *,
-    database_url: str,
-    tenant_id: str,
-    limit: int = 40,
+    *, database_url: str, tenant_id: str, limit: int = 40,
 ) -> list[AdvisorAlert]:
-    """Escalated open_questions + cases already under human_takeover."""
-    limit = max(1, min(limit, 100))
-    alerts: list[AdvisorAlert] = []
+    """List escalated questions and takeover alerts, most recent first."""
     with psycopg.connect(database_url) as conn:
         rows = conn.execute(
-            """
-            SELECT q.id, q.case_id, c.title, c.customer_email, c.status, c.route,
-                   q.requirement_key, q.reason_code, q.reason_detail,
-                   COALESCE(q.updated_at, q.created_at)::text
-            FROM open_questions q
-            JOIN cases c ON c.id = q.case_id AND c.tenant_id = q.tenant_id
-            WHERE q.tenant_id = %s
-              AND q.status = 'escalated_human'
-            ORDER BY q.updated_at DESC NULLS LAST, q.created_at DESC
-            LIMIT %s
+            _INBOX_ITEMS + """
+            SELECT * FROM inbox_items WHERE kind <> 'mail'
+            ORDER BY updated_at DESC, item_id LIMIT %s
             """,
-            (tenant_id, limit),
+            (tenant_id, tenant_id, tenant_id, max(1, min(limit, 100))),
         ).fetchall()
-        for r in rows:
-            alerts.append(
-                AdvisorAlert(
-                    question_id=r[0],
-                    case_id=r[1],
-                    case_title=r[2] or "",
-                    customer_email=r[3] or "",
-                    case_status=r[4] or "",
-                    route=r[5],
-                    requirement_key=r[6] or "",
-                    reason_code=r[7] or "",
-                    reason_detail=r[8] or "",
-                    alert_kind="escalate_question",
-                    updated_sort=r[9] or "",
-                )
+    return [_advisor_alert(row) for row in rows]
+
+
+def count_pending_advisor_inbox(*, database_url: str, tenant_id: str) -> int:
+    with psycopg.connect(database_url) as conn:
+        row = conn.execute(
+            _INBOX_ITEMS + "SELECT COUNT(*) FROM inbox_items",
+            (tenant_id, tenant_id, tenant_id),
+        ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def get_advisor_inbox(*, database_url: str, tenant_id: str) -> AdvisorInbox:
+    with psycopg.connect(database_url) as conn:
+        rows = conn.execute(
+            _INBOX_ITEMS + """
+            , ranked AS (
+                SELECT *, COUNT(*) OVER () AS pending_count,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY (kind = 'mail')
+                        ORDER BY updated_at DESC, item_id
+                    ) AS row_rank
+                FROM inbox_items
             )
-        takeover = conn.execute(
-            """
-            SELECT id, title, customer_email, status, route, updated_at::text
-            FROM cases
-            WHERE tenant_id = %s AND human_takeover = TRUE
-              AND status NOT IN ('closed', 'delivered')
-            ORDER BY updated_at DESC
-            LIMIT %s
+            SELECT * FROM ranked WHERE row_rank <= CASE WHEN kind = 'mail' THEN 100 ELSE 40 END
+            ORDER BY row_rank
             """,
-            (tenant_id, limit),
+            (tenant_id, tenant_id, tenant_id),
         ).fetchall()
-        seen_cases = {a.case_id for a in alerts}
-        for r in takeover:
-            if r[0] in seen_cases:
-                continue
-            alerts.append(
-                AdvisorAlert(
-                    question_id="",
-                    case_id=r[0],
-                    case_title=r[1] or "",
-                    customer_email=r[2] or "",
-                    case_status=r[3] or "",
-                    route=r[4],
-                    requirement_key="",
-                    reason_code="human_takeover",
-                    reason_detail="案件已标记为人工接管",
-                    alert_kind="human_takeover",
-                    updated_sort=r[5] or "",
-                )
-            )
-    alerts.sort(key=lambda a: a.updated_sort, reverse=True)
-    return alerts[:limit]
+    alerts, mail = [], []
+    for row in rows:
+        item = row[:-2]
+        if item[0] == "mail":
+            mail.append(UnassignedMail(id=item[1], sender=item[4] or "", subject=item[3]))
+        else:
+            alerts.append(_advisor_alert(item))
+    return AdvisorInbox(alerts, mail, rows[0][-2] if rows else 0)
+
+
+def get_unassigned_mail(
+    *, database_url: str, tenant_id: str, email_event_id: str,
+) -> UnassignedMail | None:
+    with psycopg.connect(database_url) as conn:
+        row = conn.execute(
+            """
+            SELECT id, COALESCE(from_addr, ''), subject, body_text
+            FROM email_events
+            WHERE tenant_id = %s AND id = %s AND direction = 'inbound'
+              AND attribution_status = 'unattributed' AND case_id IS NULL
+            """,
+            (tenant_id, email_event_id),
+        ).fetchone()
+    return UnassignedMail(*row) if row else None
 
 
 def acknowledge_advisor_question(
@@ -326,6 +378,7 @@ def close_remediation(
     case_id: str,
     requirement_key: str,
     closed_by_evidence_id: str,
+    automatic_only: bool = False,
 ) -> OpenQuestion | None:
     """Close the active remediation for a slot after a clear re-upload."""
     key = (requirement_key or "").strip()
@@ -333,16 +386,29 @@ def close_remediation(
         return None
     with psycopg.connect(database_url) as conn:
         with conn.transaction():
+            if automatic_only:
+                previous = conn.execute(
+                    _SELECT + """
+                    WHERE tenant_id = %s AND case_id = %s AND requirement_key = %s
+                      AND status = 'closed' AND closed_by_evidence_id = %s
+                      AND severity = 'simple_auto'
+                    LIMIT 1
+                    """,
+                    (tenant_id, case_id, key, closed_by_evidence_id),
+                ).fetchone()
+                if previous:
+                    return _row(previous)
             row = conn.execute(
                 """
                 SELECT id FROM open_questions
                 WHERE tenant_id = %s AND case_id = %s AND requirement_key = %s
                   AND status IN ('open', 'waiting_customer', 'escalated_human')
+                  AND (NOT %s OR severity = 'simple_auto')
                 ORDER BY created_at DESC
                 LIMIT 1
                 FOR UPDATE
                 """,
-                (tenant_id, case_id, key),
+                (tenant_id, case_id, key, automatic_only),
             ).fetchone()
             if row is None:
                 return None

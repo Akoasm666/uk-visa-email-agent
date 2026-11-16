@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import psycopg
@@ -10,6 +11,9 @@ import psycopg
 from visa_agent.domain.enums import CaseStatus, ErrorCode, RouteCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.domain.transitions import TransitionContext
+
+
+FINISHED_CASE_STATUSES = frozenset({CaseStatus.CLOSED, CaseStatus.DELIVERED})
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,18 +168,6 @@ def create_case(
             ),
         )
         conn.commit()
-    # New customer email → DB allowlist so opening/reply can send without
-    # manually editing EMAIL_OUTBOUND_ALLOWLIST in .env.
-    if customer_email:
-        from visa_agent.email_adapter.allowlist import add_outbound_allowlist_email
-
-        add_outbound_allowlist_email(
-            database_url=database_url,
-            tenant_id=tenant_id,
-            email=customer_email,
-            source="case_create",
-            case_id=case_id,
-        )
     return get_case(database_url=database_url, tenant_id=tenant_id, case_id=case_id)
 
 
@@ -207,23 +199,19 @@ def get_case(
         return _fetch(owned)
 
 
-def list_cases(
+def _case_list_filter(
     *,
-    database_url: str,
     tenant_id: str,
-    limit: int = 50,
     q: str | None = None,
     status: str | None = None,
     route: str | None = None,
     waiting: str | None = None,
-) -> list[CaseRecord]:
-    """List cases with optional search / status / route / waiting filters.
-
-    ``waiting``: customer | third_party | takeover | any_flag
-    """
-    limit = max(1, min(int(limit or 50), 200))
+    active_only: bool = False,
+) -> tuple[str, list]:
     clauses = ["tenant_id = %s"]
     params: list = [tenant_id]
+    if active_only:
+        clauses.append("status NOT IN ('closed', 'delivered')")
     needle = (q or "").strip()
     if needle:
         clauses.append(
@@ -253,16 +241,80 @@ def list_cases(
             "(waiting_customer OR waiting_third_party OR human_takeover "
             "OR system_blocked OR paused)"
         )
-    sql = (
-        _CASE_SELECT
-        + " WHERE "
-        + " AND ".join(clauses)
-        + " ORDER BY updated_at DESC LIMIT %s"
+    return " WHERE " + " AND ".join(clauses), params
+
+
+def list_cases(
+    *,
+    database_url: str,
+    tenant_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    q: str | None = None,
+    status: str | None = None,
+    route: str | None = None,
+    waiting: str | None = None,
+    active_only: bool = False,
+) -> list[CaseRecord]:
+    """List cases with optional search, status, route and waiting filters."""
+    limit = max(1, min(int(limit or 50), 200))
+    where, params = _case_list_filter(
+        tenant_id=tenant_id, q=q, status=status, route=route, waiting=waiting, active_only=active_only,
     )
-    params.append(limit)
+    sql = _CASE_SELECT + where + " ORDER BY updated_at DESC, id DESC LIMIT %s OFFSET %s"
     with psycopg.connect(database_url) as conn:
-        rows = conn.execute(sql, params).fetchall()
+        rows = conn.execute(sql, (*params, limit, offset)).fetchall()
     return [_row_to_case(r) for r in rows]
+
+
+_CASE_PAGE_STATUS_GROUPS = {
+    "lead": ["lead", "intake_authorization", "route_scope_confirmed"],
+    "customer_confirmation": ["draft_preparation", "customer_confirmation"],
+    "ready_to_deliver": ["ready_to_deliver", "sent_awaiting_ack"],
+}
+
+_CURRENT_CASE_TERMINATION_EXISTS = """
+    EXISTS (
+        SELECT 1 FROM case_terminations t
+        WHERE t.tenant_id = cases.tenant_id AND t.case_id = cases.id
+          AND t.closure_seq = cases.closure_seq
+    )
+"""
+
+
+def list_case_page(
+    *,
+    database_url: str,
+    tenant_id: str,
+    page: int,
+    page_size: int,
+    q: str | None = None,
+    status: str | None = None,
+    route: str | None = None,
+    waiting: str | None = None,
+) -> tuple[list[CaseRecord], int, int]:
+    """Return the requested workbench page and its filtered page count."""
+    where, params = _case_list_filter(tenant_id=tenant_id, q=q, route=route, waiting=waiting)
+    stage = (status or "").strip()
+    if stage == "terminated":
+        where += f" AND status = 'closed' AND {_CURRENT_CASE_TERMINATION_EXISTS}"
+    elif stage == "closed":
+        where += f"""
+            AND (status = 'delivered' OR (status = 'closed' AND NOT {_CURRENT_CASE_TERMINATION_EXISTS}))
+        """
+    elif stage:
+        where += " AND status = ANY(%s)"
+        params.append(_CASE_PAGE_STATUS_GROUPS.get(stage, [stage]))
+    with psycopg.connect(database_url) as conn:
+        conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+        count, = conn.execute("SELECT COUNT(*) FROM cases" + where, params).fetchone()
+        total_pages = (count + page_size - 1) // page_size
+        page = min(page, max(1, total_pages))
+        rows = conn.execute(
+            _CASE_SELECT + where + " ORDER BY updated_at DESC, id DESC LIMIT %s OFFSET %s",
+            (*params, page_size, (page - 1) * page_size),
+        ).fetchall()
+    return [_row_to_case(row) for row in rows], page, total_pages
 
 
 def build_transition_context(
@@ -453,8 +505,9 @@ def record_customer_confirmation(
     case_id: str,
     note: str = "",
     expected_case_version: int | None = None,
+    conn: psycopg.Connection | None = None,
 ) -> None:
-    with psycopg.connect(database_url) as conn:
+    with (nullcontext(conn) if conn is not None else psycopg.connect(database_url)) as conn:
         with conn.transaction():
             case = get_case(
                 database_url=database_url,
@@ -675,6 +728,7 @@ def record_final_review(
     package_id: str | None = None,
     recipients: list[str] | None = None,
     reviewer_id: str | None = None,
+    conn: psycopg.Connection | None = None,
 ) -> None:
     if decision not in {"approve", "reject"}:
         raise DomainError(
@@ -690,7 +744,7 @@ def record_final_review(
         recip_json = json.dumps(
             sorted({r.strip().lower() for r in recipients if r.strip()})
         )
-    with psycopg.connect(database_url) as conn:
+    with (nullcontext(conn) if conn is not None else psycopg.connect(database_url)) as conn:
         with conn.transaction():
             case = get_case(
                 database_url=database_url,
@@ -958,8 +1012,9 @@ def record_delivery_receipt(
     delivery_id: str | None = None,
     expected_case_version: int | None = None,
     expected_delivery_id: str | None = None,
+    conn: psycopg.Connection | None = None,
 ) -> None:
-    with psycopg.connect(database_url) as conn:
+    with (nullcontext(conn) if conn is not None else psycopg.connect(database_url)) as conn:
         with conn.transaction():
             case = get_case(
                 database_url=database_url,
@@ -1055,6 +1110,7 @@ def mark_inbound_processed(
     conclusion: str,
     processed_by: str,
     expected_case_version: int | None = None,
+    conn: psycopg.Connection | None = None,
 ) -> CaseRecord:
     """Explicit authorized action that clears the unprocessed-inbound send gate.
 
@@ -1074,7 +1130,7 @@ def mark_inbound_processed(
             code=ErrorCode.UNAUTHORIZED,
             message="processed_by (actor) required to mark inbound processed",
         )
-    with psycopg.connect(database_url) as conn:
+    with (nullcontext(conn) if conn is not None else psycopg.connect(database_url)) as conn:
         with conn.transaction():
             case = get_case(
                 database_url=database_url,
@@ -1127,6 +1183,11 @@ def mark_inbound_processed(
                     expected_case_version=case.case_version,
                     required=True,
                 )
+            if conclusion_key == "stop_delivery":
+                conn.execute(
+                    "UPDATE cases SET human_takeover = TRUE WHERE tenant_id = %s AND id = %s",
+                    (tenant_id, case_id),
+                )
     return get_case(database_url=database_url, tenant_id=tenant_id, case_id=case_id)
 
 
@@ -1138,17 +1199,20 @@ def attribute_inbound_to_case(
     case_id: str,
     force_reattribute: bool = False,
     reason: str = "",
+    active_case_only: bool = False,
 ) -> None:
     with psycopg.connect(database_url) as conn:
         with conn.transaction():
             # Serialize with send claim so attribution cannot slip between gate and claim.
-            get_case(
+            case = get_case(
                 database_url=database_url,
                 tenant_id=tenant_id,
                 case_id=case_id,
                 conn=conn,
                 for_update=True,
             )
+            if active_case_only and case.status in FINISHED_CASE_STATUSES:
+                raise DomainError(ErrorCode.VALIDATION_ERROR, "案件已结束，仅可查看")
             busy = conn.execute(
                 """
                 SELECT 1 FROM outbox_messages
@@ -1231,6 +1295,7 @@ def attribute_inbound_to_case(
                 """
                 SELECT id, case_id FROM case_evidence
                 WHERE tenant_id = %s AND source_email_event_id = %s
+                  AND deleted_at IS NULL
                 ORDER BY created_at
                 """,
                 (tenant_id, email_event_id),

@@ -28,10 +28,11 @@ from visa_agent.case_service import (
 from visa_agent.config import Settings
 from visa_agent.delivery import assemble_package, get_package
 from visa_agent.document_pipeline import attach_evidence, set_evidence_quarantine
-from visa_agent.domain.enums import CaseStatus, DeliveryKind, ErrorCode, OutboundMessageKind
+from visa_agent.domain.enums import CaseStatus, DeliveryKind, ErrorCode, OutboundMessageKind, RouteCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.email_adapter.errors import SendPartialAcceptedError, SendStatusUnknownError
 from visa_agent.email_adapter.outbox import build_send_operation_id
+from visa_agent.rules.service import ensure_seed_route_packs, record_requirement_applicability, record_requirement_review
 from visa_agent.send_control import PackageSendRequest, send_case_package
 from visa_agent.storage.files import LocalFileStore
 from visa_agent.storage.migrate import apply_migrations
@@ -75,6 +76,7 @@ def _accepted_evidence(
     *,
     store: LocalFileStore,
     blob: bytes = b"%PDF-s4",
+    classification: str = "passport",
 ) -> str:
     case = get_case(database_url=TEST_DB, tenant_id=TENANT, case_id=case_id)
     ev = attach_evidence(
@@ -84,7 +86,7 @@ def _accepted_evidence(
         file_store=store,
         data=blob,
         original_filename="doc.pdf",
-        classification="passport",
+        classification=classification,
         expected_case_version=case.case_version,
     )
     case = get_case(database_url=TEST_DB, tenant_id=TENANT, case_id=case_id)
@@ -226,8 +228,21 @@ class SendControlTests(unittest.TestCase):
         self.store = _store(self.settings)
 
     def _ready_final_package(self, title: str = "s4-send"):
-        case = create_case(database_url=TEST_DB, tenant_id=TENANT, title=title)
-        eid = _accepted_evidence(case.id, store=self.store)
+        ensure_seed_route_packs(database_url=TEST_DB)
+        case = create_case(database_url=TEST_DB, tenant_id=TENANT, title=title, route=RouteCode.STANDARD_VISITOR)
+        keys = dict(database_url=TEST_DB, tenant_id=TENANT, case_id=case.id)
+        evidence = []
+        for label, requirement in (
+            ("passport", "passport_valid"), ("purpose", "visit_purpose_allowed"),
+            ("itinerary", "intention_to_leave"), ("bank", "funds_for_stay"), ("employment", "home_ties"),
+        ):
+            evidence.append(_accepted_evidence(
+                case.id, store=self.store, blob=f"%PDF-s4-{label}".encode(), classification=label,
+            ))
+            record_requirement_review(**keys, requirement_key=requirement, expected_case_version=_ver(case.id))
+        for requirement in ("sponsor_if_any", "translation_if_needed", "transfer_human_triggers"):
+            record_requirement_applicability(**keys, requirement_key=requirement, decision="not_applicable",
+                                             note="synthetic test case", expected_case_version=_ver(case.id))
         _walk_to_ready(case.id)
         case = get_case(database_url=TEST_DB, tenant_id=TENANT, case_id=case.id)
         pkg = assemble_package(
@@ -236,7 +251,7 @@ class SendControlTests(unittest.TestCase):
             case_id=case.id,
             package_kind=DeliveryKind.FINAL_PACKAGE.value,
             file_store=self.store,
-            evidence_ids=[eid],
+            evidence_ids=evidence,
             expected_case_version=case.case_version,
         )
         return case, pkg
@@ -287,6 +302,22 @@ class SendControlTests(unittest.TestCase):
         self.assertEqual(row[0], pkg.package_id)
         self.assertEqual(row[1], ok.outbox_id)
         self.assertTrue(row[2])
+
+    def test_omitted_required_attachment_blocks_an_approved_package(self) -> None:
+        case, complete = self._ready_final_package()
+        passport = next(item.evidence_id for item in complete.items if item.classification == "passport")
+        partial = assemble_package(
+            database_url=TEST_DB, tenant_id=TENANT, case_id=case.id,
+            file_store=self.store, package_kind=DeliveryKind.FINAL_PACKAGE.value,
+            evidence_ids=[passport], expected_case_version=case.case_version,
+        )
+        _approve_package(case.id, partial.package_id)
+        result = send_case_package(
+            settings=self.settings, case_id=case.id, file_store=self.store,
+            req=PackageSendRequest(partial.package_id, ("allow@example.com",), "final", "package", send_now=False),
+        )
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("FINAL_PACKAGE_REQUIREMENT_BLOCKED:funds_for_stay", result.block_reasons)
 
     def test_reject_supersedes_prior_approve(self) -> None:
         case, pkg = self._ready_final_package("s4-rej")

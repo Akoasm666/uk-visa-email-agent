@@ -1,52 +1,164 @@
-# UK Visa Email Agent（LSH）
+# 英国签证助手工作台
 
-精致 demo：以 Email 为入口、案件为中心的英国签证材料准备助手。  
-首条业务路线：**Standard Visitor**。首发最终材料包一律人工放行。
+客户通过邮件提交材料和提问，顾问通过工作台查看案件、核对材料、回复客户和终审。系统能收集附件、识别客户说的行程信息、跟进补件、准备 PDF，并把需要判断的问题交给顾问。工作台提供访问签证、学生签证、技术工签和毕业生签证四类清单。**访问签证（Standard Visitor）是邮件与材料自动化最完整的路线**，下面的使用示例以它为例。
 
-## 当前阶段
+## 1. 在本地启动
 
-**S4 已验收**：材料包组装（W09）+ 发送控制（W10）。
+### 安装依赖并启动数据库
 
-| 交付物 | 路径 |
-|---|---|
-| 材料包组装 | `POST /cases/{id}/packages/assemble` · `delivery/` |
-| 包发送 | `POST /cases/{id}/packages/{package_id}/send` · `send_control/` |
-| Visitor 场景 | `GET/POST /visitor-scenarios` · `rules/visitor_pack.py` |
-| 模型网关 | `ai_capabilities/gateway.py` · `GET /cases/{id}/draft/groundedness` |
-| 冻结契约 | `docs/` + `src/visa_agent/domain/` |
-| 审核台 | `GET /cases/{id}/review-board` · 工作台案件详情 |
-| 规则容器 | `src/visa_agent/rules/` → `/rule-packs`、`/cases/{id}/requirements` |
-| 文档管线 | `src/visa_agent/document_pipeline/` → `/cases/{id}/evidence` |
-| 模型草稿 | `src/visa_agent/ai_capabilities/` → `POST /cases/{id}/draft` |
-| 工作台 | `GET /workbench`（案件）· `GET /workbench/inbox`（顾问提醒） |
-| HTTP | FastAPI：`visa_agent.fastapi_app` |
-| Postgres | `docker-compose.yml` → 宿主 `15432` |
-
-## 启动依赖
+准备 **Python 3.11 或更新版本**、Docker 和 Docker Compose。在仓库根目录执行：
 
 ```bash
-cd LSH
-docker compose up -d          # Postgres @ 127.0.0.1:15432
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev]'
+docker compose up -d postgres
+docker compose ps
 ```
 
-### 运行服务
+等 `postgres` 显示 `healthy`。Compose 将 PostgreSQL 绑定到本机 `15432` 端口，默认数据库名为 `visa_agent`。工作台和收件进程启动时都会补齐数据库表结构和自带的签证清单。
+
+### 配置仓库根目录的 `.env`
+
+以下可以作为起点。数据库配置对应仓库自带的 Docker Compose。只浏览工作台时，可以先留空邮件凭据和模型密钥。要走真实邮件流程，填写两组邮箱配置和允许收信的客户测试邮箱。
+
+```dotenv
+APP_HOST=127.0.0.1
+APP_PORT=8000
+DATABASE_URL=postgresql://visa_agent:visa_agent_dev@127.0.0.1:15432/visa_agent
+FILE_STORAGE_DIR=./data/files
+TENANT_ID=demo
+
+# SMTP 发信
+EMAIL_SMTP_HOST=
+EMAIL_SMTP_PORT=587
+EMAIL_SMTP_USER=
+EMAIL_SMTP_PASSWORD=
+EMAIL_FROM=
+
+# IMAP 收信
+EMAIL_IMAP_HOST=
+EMAIL_IMAP_PORT=993
+EMAIL_IMAP_USER=
+EMAIL_IMAP_PASSWORD=
+EMAIL_IMAP_CASE_THREADS_ONLY=true
+
+# 逗号分隔的客户测试邮箱，填自己可收信的地址
+EMAIL_OUTBOUND_ALLOWLIST=
+
+# 可选，例如 socks5://127.0.0.1:7890
+EMAIL_PROXY_URL=
+
+# 云端模型
+SILICONFLOW_API_KEY=
+SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
+SILICONFLOW_MODEL=zai-org/GLM-5.3-Flash
+
+# 管理配置，日常使用可留空
+RULE_PUBLISH_TOKEN=
+```
+
+| 配置 | 怎么填 |
+| --- | --- |
+| `DATABASE_URL`、`FILE_STORAGE_DIR`、`TENANT_ID` | Web 和收件进程使用同一组值。上例用了相对路径，两个终端都从仓库根目录启动。数据库保存案件和邮件记录，附件文件保存在 `FILE_STORAGE_DIR`。 |
+| `APP_HOST`、`APP_PORT` | 本地地址和端口。下面的 Uvicorn 命令用命令行参数指定地址和端口。改端口时一起改启动命令。 |
+| `EMAIL_SMTP_*`、`EMAIL_FROM` | 填发件服务器、账号和对应凭据，`EMAIL_FROM` 通常与发件账号一致。SMTP 使用 STARTTLS。 |
+| `EMAIL_IMAP_*` | 填收件服务器、账号和对应凭据。IMAP 使用 SSL/TLS。测试时建议用专用服务邮箱，并另备一个邮箱模拟客户。 |
+| `EMAIL_OUTBOUND_ALLOWLIST` | 填允许系统发信的客户邮箱。创建案件本身不会让客户进入发信白名单。 |
+| `EMAIL_IMAP_CASE_THREADS_ONLY` | 设为 `true` 时，收件进程只取静态白名单中客户回复到活跃案件邮件线程里的未读件。专用服务邮箱需要接收新邮件并在工作台手动归案时，可设为 `false`。 |
+| `EMAIL_PROXY_URL` | 网络需要 SOCKS5 代理时填写，SMTP 和 IMAP 共用。直连时留空。 |
+| `SILICONFLOW_*` | 填模型服务的密钥、地址和模型名。配置后启用模型提取与问答。未配置时，基础提取和部分回复走规则或转给顾问。本机扫描和译文功能另外依赖 Ollama。 |
+| `RULE_PUBLISH_TOKEN` | 可选的管理凭据。试跑工作台和邮件流程时可留空。 |
+
+例如，Gmail 的发信服务器是 `smtp.gmail.com:587`，收信服务器是 `imap.gmail.com:993`。账号支持应用专用密码时，开启两步验证后生成该密码，填入相应的密码字段。具体设置见 [Google 邮件服务器配置](https://developers.google.com/workspace/gmail/imap/imap-smtp?hl=en) 和 [应用专用密码说明](https://support.google.com/accounts/answer/185833)。
+
+上述配置由程序直接读取 `.env`。把这些变量只写进终端的 `export` 不会代替文件配置。应把凭据留在本地，`.env` 已加入 Git 忽略列表。改完后重启两个进程，确保收件进程也读到了新值。
+
+### 启动工作台与自动收件
+
+终端 A 启动 Web 服务。`--reload` 用于本地开发，修改代码时会自动重载 Web 进程。
 
 ```bash
-cd LSH
-PYTHONPATH=src python3 -m uvicorn visa_agent.fastapi_app:app --host 127.0.0.1 --port 8000
+.venv/bin/python -m uvicorn visa_agent.fastapi_app:app --host 127.0.0.1 --port 8000 --reload --reload-dir src
 ```
 
-### 测试
+浏览器打开 [案件列表](http://127.0.0.1:8000/workbench) 或 [收件箱](http://127.0.0.1:8000/workbench/inbox)。完成邮箱配置后，可按下面的使用步骤用测试邮箱走一遍流程。
+
+终端 B 在同一目录启动收件进程。它默认每 15 秒检查一次 `INBOX`，每轮最多处理 10 封。收件时会处理已归案的新邮件，也会继续发送条件已满足的材料确认邮件。修改收件代码后需重启这个进程。需要单独跑一轮时，可在停止常驻进程后给同一命令加 `--once`。
 
 ```bash
-cd LSH
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+.venv/bin/python -m visa_agent.email_adapter.worker
 ```
 
-## 阶段约定（摘要）
+### 可选：本机扫描件识别和翻译
 
-- **S4**：仅 `accepted_for_review` 证据可入包；最终包审批绑定 version+package_id+收件人；发送前复核清单哈希
-- **S3**：Visitor 标准/转人工/反例；模型仅落结构化字段 + 模板正文
-- **S2.3**：确认/审批历史；`decision_seq` 定最新决定；可重复读快照；驳回门控显示「已驳回」
-- **S2.2**：规则包人工发布（`RULE_PUBLISH_TOKEN`）；未知 ≠ 通过；隔离库 `visa_agent_test`
-- **S1**：SMTP + 白名单；模型草稿仅合成上下文
+在 macOS 安装 Xcode 命令行工具和 Ollama。Ollama 需运行在本机 `127.0.0.1:11434`，桌面应用未启动服务时可另开终端运行 `ollama serve`。下面的编译输出放在 Python 虚拟环境旁，OCR 会自动找到它。也可以在启动两个进程前，用进程环境变量 `VISA_AGENT_VISION_OCR` 指定可执行文件的绝对路径。
+
+```bash
+xcrun swiftc -O scripts/vision_ocr.swift -o .venv/bin/visa-agent-vision-ocr
+ollama pull qwen3-vl:2b-instruct
+ollama pull qwen2.5:1.5b
+```
+
+本机依赖未就绪时，可以继续打开工作台，并由顾问查看、归类和核对附件。
+
+## 2. 怎么使用
+
+### 从开案到顾问终审
+
+1. **新建案件。** 在「案件列表」右上角点「新建案件」，填写案件名、客户邮箱和签证类型。系统保存案件并尝试发出首封材料清单。要试跑全流程，确保客户邮箱在白名单内。
+2. **客户回复首封邮件。** 用客户邮箱在原邮件线程里直接回复。可以分几次上传材料，也可以在同一封邮件里提问并说明来英国做什么、哪天出发、待多久、打算去哪里。收件进程会将邮件和附件关联到案件。使用只收案件线程模式时，测试邮件应留在未读状态，等进程处理。
+3. **查看「材料清单」。** 系统会记录访问目的，拿到具体日期和天数后可生成英文行程单。顾问可以查看、核对、上传或删除材料，也可以判断某项材料是否适用。行程单可以由客户回复确认，也可以由顾问点「核对通过」。翻译草稿可在「翻译件」中查看，再点「替换译文」上传正式 PDF 后核对。
+4. **处理收件箱。** 找不到所属案件的邮件在「收件箱」点「处理」后选择案件。这里也会出现待归类的材料、需要顾问答复的问题和发信异常。红色角标显示待处理数，完成处理后减少。需要直接和客户沟通时，在案件详情选择「人工接管」，在对话区查看往来邮件并发送。处理完可以「交还系统」。
+5. **请客户确认整套材料。** 材料准备好且待处理事项清除后，系统会自动发邮件并附上材料。客户直接回复「确认材料」，案件就会进入「待终审」。如有更正，客户可直接回复要修改的内容。材料更新后，以最新的确认邮件为准。
+6. **顾问终审。** 在案件详情的「下一步」查看材料，再点「终审通过」或「终审驳回」。通过后，案件列表和详情都显示「交付中」。
+
+### 最终材料包、回执与结束案件
+
+「交付中」表示案件已通过终审，最终材料包由负责交付的人员另行处理。发出后，工作台显示「已发出，等回执」。客户直接回复交付邮件「确认收件」，案件会进入「已办完」。
+
+如果业务上需要结束服务，可在「案件状态变更」操作。**结束案件**要求案件处于「交付中」、必需材料已核对并且有客户邮箱，会尝试发送服务结束通知。**终止案件**可以填写终止理由，系统只记录终止结果。已结束、已终止和已办完的案件可回看材料和状态。
+
+### 本地试跑时从哪里排查
+
+| 现象 | 先看哪里 |
+| --- | --- |
+| 页面打不开 | 确认数据库和工作台服务都在运行，再刷新页面。 |
+| 开案后没收到邮件 | 看工作台的开案提示，再检查发件邮箱设置、客户白名单和垃圾邮件。 |
+| 邮箱有客户回复，案件没有变化 | 确认自动收件已启动。检查客户是否用开案时填写的邮箱直接回复了原邮件，以及来信是否仍未读。再到工作台收件箱找待归案邮件。 |
+| 材料上传后仍没流转 | 打开「下一步」和「材料清单」，确认有无待归类、待补、待核对的条目或顾问事项。检查访问目的、行程日期和译文要求。 |
+
+## 3. AI 工作流与交付稳定性
+
+### 模型选择与工作流设计
+
+系统用一个**按案件状态推进的流程**串起各项 AI 能力。模型理解邮件、扫描件和自然语言问题。代码保存可核对的事实、判断哪个步骤可以继续，并通过明确的发件条件执行动作。每封客户邮件可以同时包含补件、提问和行程更正，各项结果分别处理，最后再合并成一封回复。这样一来，顾问能在同一个案件里查到系统依据哪封邮件、哪份材料推进到当前步骤。
+
+```mermaid
+flowchart LR
+    A["客户来信"] --> B["关联案件并去重"]
+    B --> C["理解邮件并检查附件"]
+    C --> D{"材料齐备且问题已处理？"}
+    D -->|缺材料或需判断| E["跟进补件或交给顾问"]
+    D -->|可以继续| F["带附件请客户确认"]
+    F --> G["顾问终审"]
+    G --> H["批准并发送最终材料包"]
+    H --> I["收到客户回执"]
+```
+
+| 任务 | 实现与理由 |
+| --- | --- |
+| 理解客户说的话 | 用配置的 SiliconFlow 模型提取访问目的、日期、天数以及客户是在提问、确认、修改还是要求暂停。模型要返回原邮件片段，系统校验片段确实存在、数字和日期有效，再更新案件。云端提取请求失败时可尝试本机模型，提取仍不可用时保留已有规则作为基础处理。例子是「下个月中旬，待一周左右」会保存原话和约 7 天。具体日期补齐后才生成逐日行程。 |
+| 读材料 | JPEG 和 PNG 可先交给本机视觉模型 `qwen3-vl:2b-instruct` 看版面。PDF 和需要核对文字的材料由 OCR 提取文本，再结合本机文本模型 `qwen2.5:1.5b` 识别。模型可给出材料类型、清晰度和语言的线索。重要的证件字段还要用 OCR 结果核对。文件读不清或类别不确定时，顾问能看到原件和待办。 |
+| 准备行程和译文 | 日期范围、天数和 PDF 渲染由代码处理。需要修改活动时，模型辅助改写，应用再校验日期和输出。机器译文与原件关联，供顾问逐项核对。扫描件和自动翻译在本机处理。配置云端模型时，用来理解客户意图和回答问题的邮件文本会交给所配置的模型服务。 |
+| 回答签证材料问题 | 优先查可用的 GOV.UK / UKVI 资料，必要时补充搜索。由程序计算可复现的估算，再让模型组织语言。原问题需要个案判断、资料不足或回答未通过检查时，系统把事项留给顾问，并向客户说明会跟进。 |
+
+### 交付稳定性保障策略
+
+- **材料和邮件可以追溯。** 入库时保留邮件归属与附件原件，使用邮件标识和附件内容识别重复输入。对同一案件的来信按顺序处理。新邮件引用、发件人和案件之间的关系用于判断应该更新哪一个案件，归属不清的邮件进入收件箱。
+- **确认和审核对应实际文件。** 材料确认邮件列出的文件与发送的附件来自同一份记录。内部修订号用于关联客户确认、材料和终审。客户直接回复对应邮件即可。准备交付时，系统复制确认要发的文件，记录内容哈希和清单，审批绑定这一个包、案件当前修订和收件人。
+- **发信前再检查一遍。** 最终包即使已获批准，发送前还会检查当前案件和包中的必需材料、未处理邮件、待办、客户确认、白名单及文件哈希。客户要求暂缓时会暂停发信。交付前遇到无法解读且还未处理的客户来信时，邮件会保留待处理状态，等待系统后续识别或由顾问处理。
+- **把明确失败和结果不确定分开。** 发件任务保存操作 ID，重试继续使用同一任务。已被邮件服务商接受的任务会返回原结果。若连接中断时无法判断邮件是否已被接受，系统保留「发送结果待确认」，由顾问核实后决定下一步，避免发两份相同的材料包。
+- **通过条件明确的场景回归。** 测试覆盖相对日期、同一封邮件里同时补件和提问、换材料后旧确认失效、确认邮件的真实附件格式、最终包漏必需材料、重复发件与发送回执。最终包发件测试使用单独的 `visa_agent_test` 数据库。
+
+代码入口集中在 [邮件处理](src/visa_agent/case_service/inbound_agent.py)、[邮件字段提取](src/visa_agent/ai_capabilities/visitor_trip.py)、[材料确认](src/visa_agent/case_service/material_confirmation.py)、[材料包组装](src/visa_agent/delivery/service.py) 和 [发送前检查](src/visa_agent/send_control/service.py)。早期流程设计见 [案件状态机](docs/02-state-machine.md)。

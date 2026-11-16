@@ -85,7 +85,7 @@ def gather_research(
     # Keep top 6 by authority.
     hits.sort(key=lambda h: h.authority, reverse=True)
     top = tuple(hits[:6])
-    conf = score_research_confidence(top)
+    conf = score_research_confidence(top, question=question)
     return ResearchBundle(
         hits=top,
         confidence=conf,

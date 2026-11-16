@@ -211,8 +211,7 @@ def evaluate_outbound_gate(inp: OutboundGateInput) -> list[str]:
     if inp.system_blocked or inp.paused or inp.cancelled:
         reasons.append("SYSTEM_BLOCKED")
 
-    # Ordinary replies must not carry a delivery package.
-    if inp.kind == OutboundMessageKind.ORDINARY_REPLY.value and (
+    if inp.kind in {OutboundMessageKind.ORDINARY_REPLY, OutboundMessageKind.CASE_CLOSURE_NOTICE} and (
         inp.package_id is not None or inp.package_kind is not None
     ):
         reasons.append("VALIDATION_ERROR")

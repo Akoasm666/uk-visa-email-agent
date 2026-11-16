@@ -1,9 +1,9 @@
-"""SMTP send via configured relay (Brevo)."""
+"""Send through the configured SMTP server over STARTTLS."""
 
 from __future__ import annotations
 
+import mimetypes
 import smtplib
-import ssl
 from email.message import EmailMessage
 from smtplib import (
     SMTPException,
@@ -17,6 +17,8 @@ from visa_agent.email_adapter.errors import (
     SendPartialAcceptedError,
     SendStatusUnknownError,
 )
+from visa_agent.email_adapter.proxy import SocksSMTP
+from visa_agent.email_adapter.tls import mail_tls_context
 
 
 class SendRejectedError(RuntimeError):
@@ -46,6 +48,10 @@ def send_smtp(
     subject: str,
     body_text: str,
     attachments: list[tuple[str, bytes]] | None = None,
+    message_id: str | None = None,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+    body_html: str | None = None,
 ) -> str:
     if not settings.email_configured:
         raise RuntimeError("SMTP is not configured")
@@ -57,21 +63,28 @@ def send_smtp(
     msg["Subject"] = subject
     msg["From"] = settings.email_from
     msg["To"] = ", ".join(cleaned)
+    if message_id:
+        msg["Message-ID"] = message_id
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    if references:
+        msg["References"] = references
     msg.set_content(body_text)
+    if body_html:
+        msg.add_alternative(body_html, subtype="html")
     for filename, data in attachments or []:
+        content_type, _ = mimetypes.guess_type(filename)
+        if content_type not in {"application/pdf", "image/jpeg", "image/png"}:
+            content_type = "application/octet-stream"
+        maintype, subtype = content_type.split("/")
         msg.add_attachment(
             data,
-            maintype="application",
-            subtype="octet-stream",
+            maintype=maintype,
+            subtype=subtype,
             filename=filename,
         )
 
-    try:
-        import certifi
-
-        context = ssl.create_default_context(cafile=certifi.where())
-    except Exception:  # noqa: BLE001
-        context = ssl.create_default_context()
+    context = mail_tls_context()
 
     # Track outcomes before context __exit__ runs QUIT. A post-accept / post-partial
     # QUIT failure (e.g. 421) must not rewrite the outcome to rejected/failed.
@@ -79,9 +92,13 @@ def send_smtp(
     partial_error: SendPartialAcceptedError | None = None
 
     try:
-        with smtplib.SMTP(
-            settings.email_smtp_host, settings.email_smtp_port, timeout=30
-        ) as smtp:
+        endpoint = (settings.email_smtp_host, settings.email_smtp_port)
+        connection = (
+            SocksSMTP(*endpoint, proxy_url=settings.email_proxy_url, timeout=30)
+            if settings.email_proxy_url
+            else smtplib.SMTP(*endpoint, timeout=30)
+        )
+        with connection as smtp:
             smtp.ehlo()
             smtp.starttls(context=context)
             smtp.ehlo()
@@ -176,8 +193,8 @@ def send_smtp(
             return _format_accepted(
                 accepted_id, quit_note=f"quit_disconnect:{exc}"
             )
-        raise SendStatusUnknownError(
-            f"smtp connection lost while waiting for confirmation: {exc}"
+        raise SendRejectedError(
+            f"SMTP connection failed before sending: {exc}"
         ) from exc
     except (TimeoutError, ConnectionError) as exc:
         if partial_error is not None:
@@ -186,8 +203,8 @@ def send_smtp(
             ) from None
         if accepted_id is not None:
             return _format_accepted(accepted_id, quit_note=f"quit_error:{exc}")
-        raise SendStatusUnknownError(
-            f"smtp connection lost while waiting for confirmation: {exc}"
+        raise SendRejectedError(
+            f"SMTP connection failed before sending: {exc}"
         ) from exc
     except OSError as exc:
         if partial_error is not None:
@@ -196,8 +213,8 @@ def send_smtp(
             ) from None
         if accepted_id is not None:
             return _format_accepted(accepted_id, quit_note=f"quit_error:{exc}")
-        raise SendStatusUnknownError(
-            f"smtp connection lost while waiting for confirmation: {exc}"
+        raise SendRejectedError(
+            f"SMTP connection failed before sending: {exc}"
         ) from exc
     except SMTPException:
         raise

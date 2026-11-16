@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import psycopg
 from psycopg.errors import UniqueViolation
 
+from visa_agent.email_adapter.threading import single_message_id
 from visa_agent.storage.files import LocalFileStore
 
 
@@ -31,6 +32,8 @@ class InboundEmail:
     provider_message_id: str | None = None
     claimed_case_id: str | None = None
     attachments: tuple[InboundAttachment, ...] = ()
+    in_reply_to: str | None = None
+    references: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +114,8 @@ def _raw_payload_from_mail(mail: InboundEmail) -> bytes:
             "provider_message_id": mail.provider_message_id,
             "claimed_case_id": mail.claimed_case_id,
             "attachments": _attachments_payload(mail.attachments),
+            "in_reply_to": mail.in_reply_to,
+            "references": mail.references,
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -125,6 +130,8 @@ def _raw_payload_from_row(
     rfc_message_id: str | None,
     provider_message_id: str | None,
     claimed_case_id: str | None,
+    in_reply_to: str | None,
+    references: str | None,
     attachments: object = None,
 ) -> bytes:
     if isinstance(to_addrs, str):
@@ -139,6 +146,8 @@ def _raw_payload_from_row(
             "provider_message_id": provider_message_id,
             "claimed_case_id": claimed_case_id,
             "attachments": attachments if isinstance(attachments, list) else [],
+            "in_reply_to": in_reply_to,
+            "references": references,
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -185,6 +194,8 @@ def _backfill_original(
         rfc_message_id,
         provider_message_id,
         claimed_case_id,
+        in_reply_to,
+        references,
     ) = row
     raw = _raw_payload_from_row(
         from_addr=from_addr,
@@ -194,6 +205,8 @@ def _backfill_original(
         rfc_message_id=rfc_message_id,
         provider_message_id=provider_message_id,
         claimed_case_id=claimed_case_id,
+        in_reply_to=in_reply_to,
+        references=references,
     )
     raw_file_id = _attach_original(
         file_store=file_store,
@@ -249,7 +262,8 @@ def _existing_result(
 _SELECT_EXISTING = """
     SELECT id, attribution_status, raw_file_id,
            from_addr, to_addrs, subject, body_text,
-           rfc_message_id, provider_message_id, claimed_case_id
+           rfc_message_id, provider_message_id, claimed_case_id,
+           in_reply_to, email_references
     FROM email_events
     WHERE tenant_id = %s AND dedupe_key = %s
 """
@@ -289,11 +303,12 @@ def persist_inbound(
                     INSERT INTO email_events (
                         id, tenant_id, direction, provider_message_id, rfc_message_id,
                         dedupe_key, from_addr, to_addrs, subject, body_text, raw_file_id,
-                        case_id, claimed_case_id, attribution_status, processing_status
+                        case_id, claimed_case_id, attribution_status, processing_status,
+                        in_reply_to, email_references
                     ) VALUES (
                         %s, %s, 'inbound', %s, %s,
                         %s, %s, %s::jsonb, %s, %s, NULL,
-                        NULL, %s, 'unattributed', 'unprocessed'
+                        NULL, %s, 'unattributed', 'unprocessed', %s, %s
                     )
                     ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
                     RETURNING id, attribution_status
@@ -302,13 +317,15 @@ def persist_inbound(
                         event_id,
                         tenant_id,
                         mail.provider_message_id,
-                        mail.rfc_message_id,
+                        single_message_id(mail.rfc_message_id),
                         dedupe_key,
                         mail.from_addr,
                         json.dumps(list(mail.to_addrs)),
                         mail.subject,
                         mail.body_text,
                         mail.claimed_case_id,
+                        mail.in_reply_to,
+                        mail.references,
                     ),
                 ).fetchone()
                 if row is not None:

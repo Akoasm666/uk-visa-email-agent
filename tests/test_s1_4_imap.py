@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from visa_agent.config import get_settings
 from visa_agent.email_adapter.imap_poll import (
+    _case_thread_uids,
     poll_imap_inbox,
     stable_imap_provider_id,
 )
@@ -66,6 +68,27 @@ class FakeImapUidClient:
                 self.unseen.remove(uid_s)
             return ("OK", [b""])
         raise AssertionError(f"unexpected UID command {command}")
+
+
+class CaseThreadFilterTests(unittest.TestCase):
+    def test_only_expected_sender_and_thread_are_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = replace(get_settings(Path(tmp) / ".env"),
+                               outbound_allowlist=frozenset({"customer@example.com"}))
+        known = b"In-Reply-To: <opening@example.com>\r\n"
+        client = FakeImapUidClient({
+            "1": b"From: Customer <customer@example.com>\r\n" + known + b"\r\n",
+            "2": b"From: customer@example.com\r\nReferences: <personal@example.com>\r\n\r\n",
+            "3": b"From: customer@example.com.other.test\r\n" + known + b"\r\n",
+        })
+        with patch("visa_agent.email_adapter.imap_poll.psycopg.connect") as connect:
+            conn = connect.return_value.__enter__.return_value
+            conn.execute.return_value.fetchall.return_value = [
+                ("customer@example.com", "<opening@example.com>"),
+            ]
+            self.assertEqual(_case_thread_uids(client, settings, 10), [b"1"])
+        self.assertTrue(all("HEADER.FIELDS" in parts for parts in client.fetch_parts))
+        self.assertEqual(client.seen, [])
 
 
 class ImapPollTests(unittest.TestCase):

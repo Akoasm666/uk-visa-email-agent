@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 os.environ["VISA_AGENT_SKIP_APP_BOOT"] = "1"
 
@@ -14,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from tests.db_isolation import TEST_DB, TEST_PUBLISH_TOKEN, reset_test_database
 from visa_agent.case_service import create_case, get_case, set_case_route
+from visa_agent.case_service.outreach import OpeningOutreachResult
 from visa_agent.config import Settings
 from visa_agent.domain.enums import CaseStatus, ErrorCode, RouteCode
 from visa_agent.domain.errors import DomainError
@@ -292,17 +294,24 @@ class MultiRoutePackTests(unittest.TestCase):
         self.assertEqual(evaluated.pack_version, VISITOR_PACK_VERSION_S3)
 
     def test_workbench_create_honours_route_picker(self) -> None:
-        resp = self.client.post(
-            "/workbench/cases",
-            data={
-                "title": "wb-student",
-                "customer_email": "s@example.com",
-                "route": RouteCode.STUDENT.value,
-            },
-            follow_redirects=False,
+        outcome = OpeningOutreachResult(
+            attempted=True, sent=False, skipped_reason="blocked", outbox=None
         )
+        with patch(
+            "visa_agent.fastapi_app.send_opening_outreach", return_value=outcome
+        ) as outreach:
+            resp = self.client.post(
+                "/workbench/cases",
+                data={
+                    "title": "wb-student",
+                    "customer_email": "s@example.com",
+                    "route": RouteCode.STUDENT.value,
+                },
+                follow_redirects=False,
+            )
+        outreach.assert_called_once()
         self.assertEqual(resp.status_code, 303)
-        case_id = resp.headers["location"].rsplit("/", 1)[-1]
+        case_id = urlsplit(resp.headers["location"]).path.rsplit("/", 1)[-1]
         case = get_case(database_url=TEST_DB, tenant_id=TENANT, case_id=case_id)
         self.assertEqual(case.route, RouteCode.STUDENT)
 

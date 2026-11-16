@@ -7,7 +7,9 @@ import os
 from typing import Any
 from urllib.parse import parse_qs, quote
 
-from fastapi import FastAPI, HTTPException, Request
+import psycopg
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -25,7 +27,6 @@ from visa_agent.case_service import (
     get_case_review_page,
     require_customer_email,
     send_opening_outreach,
-    try_auto_attribute_inbound_by_customer_email,
     get_review_board,
     list_cases,
     mark_inbound_processed,
@@ -40,15 +41,28 @@ from visa_agent.case_service import (
 from visa_agent.case_service.advisor_actions import (
     advisor_classify_evidence,
     advisor_reply_via_agent,
+    fill_takeover_customer_email,
+    list_customer_mail,
+    send_takeover_reply,
 )
+from visa_agent.case_service.closure import (
+    close_customer_case, closure_notice_status, required_materials_verified, termination_reasons,
+)
+from visa_agent.case_service.inbound_agent import process_customer_inbound, process_persisted_inbound
+from visa_agent.case_service.itinerary import get_case_itinerary
+from visa_agent.case_service.material_confirmation import material_confirmation_sent
 from visa_agent.case_service.remediation import (
     acknowledge_advisor_question,
-    list_advisor_alerts,
+    count_pending_advisor_inbox,
+    get_advisor_inbox,
+    get_unassigned_mail,
     list_open_questions,
 )
-from visa_agent.case_service.service import bump_case_version
+from visa_agent.case_service.service import (
+    FINISHED_CASE_STATUSES, build_transition_context, bump_case_version, list_case_page,
+)
 from visa_agent.config import Settings, get_settings
-from visa_agent.domain.enums import CaseStatus, ErrorCode, RouteCode
+from visa_agent.domain.enums import CaseStatus, ErrorCode, OutboundMessageKind, RouteCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.document_pipeline import (
     attach_evidence,
@@ -61,6 +75,7 @@ from visa_agent.document_pipeline import (
     run_ocr_on_evidence,
     set_evidence_quarantine,
 )
+from visa_agent.document_pipeline.service import delete_evidence, mark_evidence_viewed
 from visa_agent.email_adapter import (
     InboundEmail,
     OutboxRequest,
@@ -68,6 +83,7 @@ from visa_agent.email_adapter import (
     persist_inbound,
     poll_imap_inbox,
 )
+from visa_agent.email_adapter.allowlist import effective_outbound_allowlist, normalize_email
 from visa_agent.http_app import build_health
 from visa_agent.rules import (
     ensure_seed_route_packs,
@@ -80,6 +96,7 @@ from visa_agent.rules import (
     publish_rule_pack,
     set_case_active_pack,
 )
+from visa_agent.rules.service import record_requirement_applicability, record_requirement_review
 from visa_agent.storage.files import LocalFileStore
 from visa_agent.storage.migrate import apply_migrations
 from visa_agent.workbench.pages import (
@@ -87,6 +104,7 @@ from visa_agent.workbench.pages import (
     render_evidence_view,
     render_inbox,
     render_list,
+    render_unassigned_mail,
 )
 from visa_agent.workflow.transitions import apply_transition, list_allowed_targets
 
@@ -134,6 +152,8 @@ class InboundBody(BaseModel):
     rfc_message_id: str | None = None
     provider_message_id: str | None = None
     claimed_case_id: str | None = None
+    in_reply_to: str | None = None
+    references: str | None = None
     attachments: list[InboundAttachmentBody] = Field(default_factory=list)
 
 
@@ -315,19 +335,6 @@ def _parse_expected_version(raw: str | None) -> int | None:
         ) from exc
 
 
-def _parse_expected_closure_seq(raw: str | None) -> int | None:
-    if raw is None or raw == "":
-        return None
-    try:
-        return int(raw)
-    except (TypeError, ValueError) as exc:
-        raise DomainError(
-            code=ErrorCode.VALIDATION_ERROR,
-            message="expected_closure_seq must be an integer",
-            details=(str(raw),),
-        ) from exc
-
-
 def _case_payload(case: Any) -> dict[str, Any]:
     return {
         "case_id": case.id,
@@ -391,23 +398,17 @@ def inbound_email(body: InboundBody) -> dict[str, Any]:
             provider_message_id=body.provider_message_id,
             claimed_case_id=body.claimed_case_id,
             attachments=attachments,
+            in_reply_to=body.in_reply_to,
+            references=body.references,
         ),
         file_store=LocalFileStore(settings.file_storage_dir),
     )
-    attributed_case_id = None
-    agent_result = None
-    if result.attribution_status == "unattributed" and not result.duplicate:
-        attributed_case_id = try_auto_attribute_inbound_by_customer_email(
-            settings=settings,
-            email_event_id=result.email_event_id,
-            from_addr=body.from_addr,
+    try:
+        attributed_case_id, agent_result = process_persisted_inbound(
+            settings=settings, email_event_id=result.email_event_id,
         )
-    if attributed_case_id and not result.duplicate:
-        agent_result = process_inbound_after_attribution(
-            settings=settings,
-            case_id=attributed_case_id,
-            email_event_id=result.email_event_id,
-        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
     return {
         "success": True,
         "status_code_hint": 200 if result.duplicate else 201,
@@ -442,6 +443,16 @@ def inbound_email(body: InboundBody) -> dict[str, Any]:
 
 @app.post("/internal/email/outbox")
 def outbox_email(body: OutboxBody) -> dict[str, Any]:
+    from visa_agent.email_adapter.outbox import (
+        CLOSURE_NOTICE_OPERATION_PREFIX, INBOUND_REPLY_OPERATION_PREFIX, MATERIAL_CONFIRMATION_OPERATION_PREFIX,
+        TAKEOVER_REPLY_OPERATION_PREFIX,
+    )
+
+    if body.kind == OutboundMessageKind.CASE_CLOSURE_NOTICE or (body.send_operation_id or "").strip().startswith((
+        CLOSURE_NOTICE_OPERATION_PREFIX, INBOUND_REPLY_OPERATION_PREFIX, MATERIAL_CONFIRMATION_OPERATION_PREFIX,
+        TAKEOVER_REPLY_OPERATION_PREFIX,
+    )):
+        raise HTTPException(status_code=400, detail="reserved reply operation ID")
     live = get_settings()
     result = enqueue_and_maybe_send(
         settings=live,
@@ -776,13 +787,11 @@ def api_attribute(case_id: str, body: AttributeBody) -> dict[str, Any]:
             force_reattribute=body.force_reattribute,
             reason=body.reason,
         )
+        agent_result = process_inbound_after_attribution(
+            settings=settings, case_id=case_id, email_event_id=body.email_event_id,
+        )
     except DomainError as exc:
         raise _domain_http(exc) from exc
-    agent_result = process_inbound_after_attribution(
-        settings=settings,
-        case_id=case_id,
-        email_event_id=body.email_event_id,
-    )
     return {
         "success": True,
         "data": {
@@ -1491,6 +1500,50 @@ def _wb_redirect(case_id: str, msg: str) -> RedirectResponse:
     )
 
 
+@app.post("/workbench/cases/{case_id}/close")
+async def workbench_close_case(case_id: str, request: Request) -> RedirectResponse:
+    form = await _form(request)
+    operation = form.get("operation", "complete")
+    if operation not in {"complete", "terminate"}:
+        return _wb_redirect(case_id, "请选择有效的案件状态操作")
+    terminate = operation == "terminate"
+    try:
+        result = await run_in_threadpool(
+            close_customer_case, settings=get_settings(), case_id=case_id,
+            expected_case_version=_parse_expected_version(form.get("expected_case_version")),
+            terminate=terminate, reason=form.get("reason", ""),
+        )
+    except (DomainError, ValueError) as exc:
+        return _wb_redirect(case_id, str(exc))
+    message = "案件已终止" if terminate else "案件已结束"
+    if result and result.status == "provider_accepted":
+        message += "，通知邮件已发出"
+    elif result and "OUTBOUND_NOT_ALLOWLISTED" in result.block_reasons:
+        message += "，客户邮箱不在允许发信的名单中"
+    return _wb_redirect(case_id, message)
+
+
+def _require_editable_workbench_case(case_id: str) -> None:
+    settings = get_settings()
+    try:
+        case = get_case(
+            database_url=settings.database_url, tenant_id=settings.tenant_id, case_id=case_id,
+        )
+    except DomainError as exc:
+        raise _domain_http(exc) from exc
+    if case.status in FINISHED_CASE_STATUSES:
+        raise HTTPException(status_code=409, detail="案件已结束，仅可查看")
+
+
+_workbench_case_actions = APIRouter(
+    prefix="/workbench/cases/{case_id}",
+    dependencies=[Depends(_require_editable_workbench_case)],
+)
+
+
+_WORKBENCH_PAGE_SIZE = 20
+
+
 @app.get("/workbench", response_class=HTMLResponse)
 def workbench_list(
     request: Request,
@@ -1498,27 +1551,31 @@ def workbench_list(
     status: str | None = None,
     route: str | None = None,
     waiting: str | None = None,
+    page: int = Query(1, ge=1),
 ) -> HTMLResponse:
     settings = get_settings()
-    cases = list_cases(
+    cases, page, total_pages = list_case_page(
         database_url=settings.database_url,
         tenant_id=settings.tenant_id,
         q=q,
         status=status,
         route=route,
         waiting=waiting,
-        limit=100,
+        page=page,
+        page_size=_WORKBENCH_PAGE_SIZE,
     )
-    alert_count = len(
-        list_advisor_alerts(
-            database_url=settings.database_url,
-            tenant_id=settings.tenant_id,
-        )
+    pending_count = count_pending_advisor_inbox(
+        database_url=settings.database_url, tenant_id=settings.tenant_id,
     )
     return HTMLResponse(
         render_list(
             cases,
-            alert_count=alert_count,
+            alert_count=pending_count,
+            page=page,
+            total_pages=total_pages,
+            terminated_case_ids=set(termination_reasons(
+                settings, [case.id for case in cases if case.status == CaseStatus.CLOSED],
+            )),
             filters={
                 "q": q or "",
                 "status": status or "",
@@ -1534,16 +1591,62 @@ def workbench_list(
 def workbench_inbox(request: Request) -> HTMLResponse:
     """Advisor reminder page — separate from the case list home."""
     settings = get_settings()
-    alerts = list_advisor_alerts(
-        database_url=settings.database_url,
-        tenant_id=settings.tenant_id,
+    inbox = get_advisor_inbox(
+        database_url=settings.database_url, tenant_id=settings.tenant_id,
     )
     return HTMLResponse(
-        render_inbox(alerts, message=request.query_params.get("msg"))
+        render_inbox(
+            inbox.alerts, message=request.query_params.get("msg"),
+            unassigned_mail=inbox.unassigned_mail, pending_count=inbox.pending_count,
+        )
     )
 
 
-@app.post("/workbench/cases/{case_id}/advisor-ack")
+@app.get("/workbench/inbox/mail/{email_event_id}", response_class=HTMLResponse)
+def workbench_review_unassigned_mail(
+    email_event_id: str, request: Request, q: str = "",
+) -> HTMLResponse:
+    settings = get_settings()
+    keys = {"database_url": settings.database_url, "tenant_id": settings.tenant_id}
+    mail = get_unassigned_mail(**keys, email_event_id=email_event_id)
+    if mail is None:
+        raise HTTPException(status_code=404, detail="来信已归属或不存在")
+    return HTMLResponse(render_unassigned_mail(
+        mail, list_cases(**keys, q=q, active_only=True, limit=100), q=q,
+        pending_count=count_pending_advisor_inbox(**keys), message=request.query_params.get("msg"),
+    ))
+
+
+@app.post("/workbench/inbox/mail/{email_event_id}")
+async def workbench_assign_mail(email_event_id: str, request: Request) -> RedirectResponse:
+    form = await _form(request)
+    settings = get_settings()
+    keys = {"database_url": settings.database_url, "tenant_id": settings.tenant_id}
+    if get_unassigned_mail(**keys, email_event_id=email_event_id) is None:
+        return RedirectResponse("/workbench/inbox", status_code=303)
+    case_id = form.get("case_id", "").strip()
+    try:
+        if not case_id:
+            raise DomainError(ErrorCode.VALIDATION_ERROR, "请选择案件")
+        attribute_inbound_to_case(
+            **keys, email_event_id=email_event_id, case_id=case_id,
+            reason="workbench_inbox", active_case_only=True,
+        )
+    except DomainError as exc:
+        msg = quote(f"处理失败：{exc.message}")
+        return RedirectResponse(f"/workbench/inbox/mail/{quote(email_event_id)}?msg={msg}", status_code=303)
+
+    msg = "来信已归到案件"
+    try:
+        process_customer_inbound(
+            settings=settings, case_id=case_id, email_event_id=email_event_id, send_reply=False,
+        )
+    except DomainError as exc:
+        msg += f"，材料处理失败：{exc.message}"
+    return RedirectResponse(f"/workbench/inbox?msg={quote(msg)}", status_code=303)
+
+
+@_workbench_case_actions.post("/advisor-ack")
 async def workbench_advisor_ack(case_id: str, request: Request) -> RedirectResponse:
     """Advisor marks an escalated inbox item as handled (no forced takeover)."""
     form = await _form(request)
@@ -1576,7 +1679,7 @@ async def workbench_advisor_ack(case_id: str, request: Request) -> RedirectRespo
     return _after("已标记处理")
 
 
-@app.post("/workbench/cases/{case_id}/evidence/{evidence_id}/classify")
+@_workbench_case_actions.post("/evidence/{evidence_id}/classify")
 async def workbench_classify_evidence(
     case_id: str, evidence_id: str, request: Request
 ) -> RedirectResponse:
@@ -1603,7 +1706,7 @@ async def workbench_classify_evidence(
     )
 
 
-@app.post("/workbench/cases/{case_id}/advisor-reply")
+@_workbench_case_actions.post("/advisor-reply")
 async def workbench_advisor_reply(case_id: str, request: Request) -> RedirectResponse:
     """Advisor answer → agent outbox → customer (not a side-channel SMTP)."""
     form = await _form(request)
@@ -1617,14 +1720,12 @@ async def workbench_advisor_reply(case_id: str, request: Request) -> RedirectRes
         )
         if result.outbox.block_reasons:
             msg = "出箱被拦住：" + ",".join(result.outbox.block_reasons)
-        elif result.outbox.status in {
-            "provider_accepted",
-            "pending",
-            "status_unknown",
-        }:
+        elif result.outbox.status == "provider_accepted":
             msg = "已由 Agent 发给客户"
             if result.closed_question:
                 msg += "，提问待办已关闭"
+        elif result.outbox.status in {"pending", "status_unknown"}:
+            msg = "发送结果待确认"
         else:
             msg = f"发送状态：{result.outbox.status}"
     except DomainError as exc:
@@ -1669,6 +1770,13 @@ async def workbench_create(request: Request) -> RedirectResponse:
 
 @app.get("/workbench/cases/{case_id}", response_class=HTMLResponse)
 def workbench_detail(case_id: str, request: Request) -> HTMLResponse:
+    return _render_workbench_detail(case_id, request)
+
+
+def _render_workbench_detail(
+    case_id: str, request: Request, *, reply_form: dict[str, str] | None = None,
+    reply_message: str | None = None,
+) -> HTMLResponse:
     settings = get_settings()
     try:
         case, board = get_case_review_page(
@@ -1678,11 +1786,7 @@ def workbench_detail(case_id: str, request: Request) -> HTMLResponse:
         )
     except DomainError as exc:
         raise _domain_http(exc) from exc
-    allowed = list_allowed_targets(
-        database_url=settings.database_url,
-        tenant_id=settings.tenant_id,
-        case_id=case_id,
-    )
+    can_edit = case.status not in FINISHED_CASE_STATUSES
     drafts = list_case_drafts(
         database_url=settings.database_url,
         tenant_id=settings.tenant_id,
@@ -1701,13 +1805,21 @@ def workbench_detail(case_id: str, request: Request) -> HTMLResponse:
     )
     requirement_states: list[Any] = []
     requirement_titles: dict[str, str] = {}
+    completion_ready = False
     try:
         evaluated = evaluate_case_requirements(
             database_url=settings.database_url,
             tenant_id=settings.tenant_id,
             case_id=case_id,
+            preview_unbound=True,
+            persist_states=can_edit,
         )
         requirement_states = list(evaluated.states)
+        completion_ready = (
+            case.status == CaseStatus.READY_TO_DELIVER
+            and evaluated.case_version == case.case_version
+            and required_materials_verified(evaluated.states)
+        )
         pack = get_rule_pack(
             database_url=settings.database_url,
             pack_id=evaluated.pack_id,
@@ -1722,17 +1834,22 @@ def workbench_detail(case_id: str, request: Request) -> HTMLResponse:
                 case_id=case_id,
             )
         )
-    advisor_items = list_open_questions(
-        database_url=settings.database_url,
-        tenant_id=settings.tenant_id,
-        case_id=case_id,
-        active_only=True,
+    advisor_items = []
+    if can_edit:
+        advisor_items = list_open_questions(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            active_only=True,
+        )
+    termination_reason = (
+        termination_reasons(settings, [case.id]).get(case.id) if case.status == CaseStatus.CLOSED else None
     )
     msg = request.query_params.get("msg")
+    reply_active = can_edit and case.human_takeover
     return HTMLResponse(
         render_detail(
             case,
-            allowed=allowed,
             message=msg,
             drafts=drafts,
             evidence_items=evidence_items,
@@ -1741,11 +1858,116 @@ def workbench_detail(case_id: str, request: Request) -> HTMLResponse:
             requirement_states=requirement_states,
             requirement_titles=requirement_titles or None,
             advisor_items=advisor_items,
+            itinerary=get_case_itinerary(settings=settings, case_id=case_id),
+            confirmation_sent=material_confirmation_sent(settings, case),
+            closure_status=closure_notice_status(settings, case)
+            if case.status == CaseStatus.CLOSED and termination_reason is None else None,
+            completion_ready=completion_ready,
+            termination_reason=termination_reason,
+            materials_message=request.query_params.get("materials_msg"),
+            customer_mail=list_customer_mail(settings, case) if reply_active else None,
+            reply_allowed=reply_active and normalize_email(case.customer_email) in effective_outbound_allowlist(settings),
+            reply_form=reply_form,
+            reply_message=reply_message or request.query_params.get("reply_msg"),
         )
     )
 
 
-@app.post("/workbench/cases/{case_id}/route")
+@_workbench_case_actions.post("/customer-email", response_class=HTMLResponse)
+async def workbench_fill_customer_email(case_id: str, request: Request) -> HTMLResponse:
+    form = await _form(request)
+    try:
+        await run_in_threadpool(
+            fill_takeover_customer_email,
+            settings=get_settings(), case_id=case_id, customer_email=form.get("customer_email", ""),
+            expected_case_version=_parse_expected_version(form.get("expected_case_version")),
+        )
+        message = "客户邮箱已保存"
+    except DomainError as exc:
+        message = f"保存失败：{exc.message}"
+    return await run_in_threadpool(_render_workbench_detail, case_id, request, reply_form=form, reply_message=message)
+
+
+@_workbench_case_actions.post("/takeover-reply", response_model=None)
+async def workbench_takeover_reply(case_id: str, request: Request) -> RedirectResponse | HTMLResponse:
+    form = await _form(request)
+    try:
+        result = await run_in_threadpool(
+            send_takeover_reply,
+            settings=get_settings(), case_id=case_id, body=form.get("body", ""),
+            request_id=form.get("request_id", ""), reply_event_id=form.get("reply_event_id", ""),
+            expected_case_version=_parse_expected_version(form.get("expected_case_version")),
+        )
+    except DomainError as exc:
+        message = f"发送失败：{exc.message}"
+        form.pop("request_id", None)
+    else:
+        if result.status == "provider_accepted" and not result.block_reasons:
+            message = quote("邮件已发送")
+            return RedirectResponse(f"/workbench/cases/{case_id}?reply_msg={message}#customer-reply", status_code=303)
+        if result.block_reasons or result.status in {"blocked", "failed"}:
+            detail = "请检查案件状态或发信设置后重试"
+            if "OUTBOUND_NOT_ALLOWLISTED" in result.block_reasons:
+                detail = "客户邮箱不在允许发信的名单中"
+            elif "CONFLICT_VERSION" in result.block_reasons:
+                detail = "案件信息有更新，请核对后重试"
+            message = f"发送失败：{detail}"
+            if result.status in {"blocked", "failed"}:
+                form.pop("request_id", None)
+        else:
+            message = "发送结果待确认，请先核对发件记录"
+    return await run_in_threadpool(_render_workbench_detail, case_id, request, reply_form=form, reply_message=message)
+
+
+@_workbench_case_actions.post("/requirements/{requirement_key}/applicability")
+async def workbench_requirement_applicability(
+    case_id: str, requirement_key: str, request: Request,
+) -> RedirectResponse:
+    form = await _form(request)
+    settings = get_settings()
+    try:
+        record_requirement_applicability(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            requirement_key=requirement_key,
+            decision=form.get("decision", "invalid"),
+            note=form.get("note", ""),
+            expected_case_version=_parse_expected_version(form.get("expected_case_version")),
+        )
+        msg = "材料判断已保存"
+    except DomainError as exc:
+        detail = "案件有更新，请根据当前清单重新判断" if exc.code == ErrorCode.CONFLICT_VERSION else exc.message
+        msg = f"保存失败：{detail}"
+    return RedirectResponse(
+        url=f"/workbench/cases/{case_id}?materials_msg={quote(msg)}#materials", status_code=303,
+    )
+
+
+@_workbench_case_actions.post("/requirements/{requirement_key}/review")
+async def workbench_review_requirement(
+    case_id: str, requirement_key: str, request: Request,
+) -> RedirectResponse:
+    form = await _form(request)
+    settings = get_settings()
+    try:
+        record_requirement_review(
+            database_url=settings.database_url,
+            tenant_id=settings.tenant_id,
+            case_id=case_id,
+            requirement_key=requirement_key,
+            expected_case_version=_parse_expected_version(form.get("expected_case_version")),
+        )
+        msg = "材料核对已保存"
+    except DomainError as exc:
+        detail = "材料有更新，请刷新后重新核对" if exc.code == ErrorCode.CONFLICT_VERSION else exc.message
+        msg = f"保存失败：{detail}"
+    return RedirectResponse(
+        url=f"/workbench/cases/{case_id}?materials_msg={quote(msg)}#materials", status_code=303,
+    )
+
+
+@_workbench_case_actions.post("/route")
 async def workbench_set_route(case_id: str, request: Request) -> RedirectResponse:
     form = await _form(request)
     settings = get_settings()
@@ -1771,17 +1993,27 @@ async def workbench_set_route(case_id: str, request: Request) -> RedirectRespons
     return _wb_redirect(case_id, msg)
 
 
-@app.post("/workbench/cases/{case_id}/transition")
+@_workbench_case_actions.post("/transition")
 async def workbench_transition(case_id: str, request: Request) -> RedirectResponse:
     form = await _form(request)
     target = form.get("target") or ""
     settings = get_settings()
     try:
+        target_status = CaseStatus(target)
+        if target_status == CaseStatus.CLOSED:
+            return RedirectResponse(url=f"/workbench/cases/{case_id}/close", status_code=307)
+        case = get_case(database_url=settings.database_url, tenant_id=settings.tenant_id, case_id=case_id)
+        if case.route == RouteCode.STANDARD_VISITOR and (case.status, target_status) in {
+            (CaseStatus.COLLECT_AND_VERIFY, CaseStatus.DRAFT_PREPARATION),
+            (CaseStatus.DRAFT_PREPARATION, CaseStatus.CUSTOMER_CONFIRMATION),
+            (CaseStatus.CUSTOMER_CONFIRMATION, CaseStatus.FINAL_REVIEW),
+        }:
+            return _wb_redirect(case_id, "此步骤由 Agent 根据材料和客户邮件自动处理")
         apply_transition(
             database_url=settings.database_url,
             tenant_id=settings.tenant_id,
             case_id=case_id,
-            target=CaseStatus(target),
+            target=target_status,
             expected_case_version=_parse_expected_version(
                 form.get("expected_case_version")
             ),
@@ -1792,7 +2024,7 @@ async def workbench_transition(case_id: str, request: Request) -> RedirectRespon
     return _wb_redirect(case_id, msg)
 
 
-@app.post("/workbench/cases/{case_id}/takeover")
+@_workbench_case_actions.post("/takeover")
 async def workbench_takeover(case_id: str, request: Request) -> RedirectResponse:
     form = await _form(request)
     settings = get_settings()
@@ -1812,18 +2044,22 @@ async def workbench_takeover(case_id: str, request: Request) -> RedirectResponse
     return _wb_redirect(case_id, msg)
 
 
-@app.post("/workbench/cases/{case_id}/confirm")
+@_workbench_case_actions.post("/confirm")
 async def workbench_confirm(case_id: str, request: Request) -> RedirectResponse:
     form = await _form(request)
     settings = get_settings()
     try:
+        version = _parse_expected_version(form.get("expected_case_version"))
+        case = get_case(database_url=settings.database_url, tenant_id=settings.tenant_id, case_id=case_id)
+        if case.route == RouteCode.STANDARD_VISITOR and case.status in {
+            CaseStatus.COLLECT_AND_VERIFY, CaseStatus.DRAFT_PREPARATION, CaseStatus.CUSTOMER_CONFIRMATION,
+        }:
+            return _wb_redirect(case_id, "Agent 会在收到客户确认材料的邮件后自动送终审")
         record_customer_confirmation(
             database_url=settings.database_url,
             tenant_id=settings.tenant_id,
             case_id=case_id,
-            expected_case_version=_parse_expected_version(
-                form.get("expected_case_version")
-            ),
+            expected_case_version=version,
         )
         msg = "customer confirmed"
     except DomainError as exc:
@@ -1831,53 +2067,39 @@ async def workbench_confirm(case_id: str, request: Request) -> RedirectResponse:
     return _wb_redirect(case_id, msg)
 
 
-@app.post("/workbench/cases/{case_id}/reviews")
+@_workbench_case_actions.post("/reviews")
 async def workbench_review(case_id: str, request: Request) -> RedirectResponse:
     form = await _form(request)
     decision = form.get("decision") or ""
     settings = get_settings()
     try:
-        record_final_review(
-            database_url=settings.database_url,
-            tenant_id=settings.tenant_id,
-            case_id=case_id,
-            decision=decision,
-            expected_case_version=_parse_expected_version(
-                form.get("expected_case_version")
-            ),
-        )
+        keys = dict(database_url=settings.database_url, tenant_id=settings.tenant_id, case_id=case_id)
+        version = _parse_expected_version(form.get("expected_case_version"))
+        with psycopg.connect(settings.database_url) as conn:
+            case = get_case(**keys, conn=conn, for_update=True)
+            if case.status != CaseStatus.FINAL_REVIEW:
+                raise DomainError(ErrorCode.VALIDATION_ERROR, "案件当前不在终审阶段")
+            context = build_transition_context(case=case, conn=conn)
+            if context.customer_confirmation_case_version != case.case_version:
+                raise DomainError(ErrorCode.CUSTOMER_CONFIRMATION_REQUIRED, "请等客户确认当前材料")
+            record_final_review(**keys, decision=decision, expected_case_version=version, conn=conn)
+            if decision == "approve":
+                apply_transition(
+                    **keys, target=CaseStatus.READY_TO_DELIVER, expected_case_version=version, conn=conn,
+                )
         msg = f"review:{decision}"
     except DomainError as exc:
         msg = str(exc)
     return _wb_redirect(case_id, msg)
 
 
-@app.post("/workbench/cases/{case_id}/reopen-grant")
-async def workbench_reopen(case_id: str, request: Request) -> RedirectResponse:
-    form = await _form(request)
-    settings = get_settings()
-    try:
-        record_reopen_grant(
-            database_url=settings.database_url,
-            tenant_id=settings.tenant_id,
-            case_id=case_id,
-            expected_case_version=_parse_expected_version(
-                form.get("expected_case_version")
-            ),
-            expected_closure_seq=_parse_expected_closure_seq(
-                form.get("expected_closure_seq")
-            ),
-        )
-        msg = "reopen authorized"
-    except DomainError as exc:
-        msg = str(exc)
-    return _wb_redirect(case_id, msg)
-
-
-@app.post("/workbench/cases/{case_id}/draft")
+@_workbench_case_actions.post("/draft")
 async def workbench_draft(case_id: str) -> RedirectResponse:
     settings = get_settings()
     try:
+        case = get_case(database_url=settings.database_url, tenant_id=settings.tenant_id, case_id=case_id)
+        if case.route == RouteCode.STANDARD_VISITOR:
+            return _wb_redirect(case_id, "材料核对后由 Agent 自动生成并发出确认邮件")
         draft = generate_case_draft(settings=settings, case_id=case_id)
         msg = f"draft ready ({draft.model_call_id[:8]})"
     except DomainError as exc:
@@ -1905,6 +2127,22 @@ def _workbench_evidence_path(case_id: str, evidence_id: str):
     return settings, evidence, path
 
 
+@_workbench_case_actions.post("/evidence/{evidence_id}/delete")
+async def workbench_delete_evidence(case_id: str, evidence_id: str, request: Request) -> RedirectResponse:
+    settings = get_settings()
+    form = await _form(request)
+    try:
+        delete_evidence(
+            database_url=settings.database_url, tenant_id=settings.tenant_id,
+            case_id=case_id, evidence_id=evidence_id,
+            expected_case_version=_parse_expected_version(form.get("expected_case_version")),
+        )
+        message = "材料已从案件移除，原审批需重新确认"
+    except DomainError as exc:
+        message = str(exc)
+    return _wb_redirect(case_id, message)
+
+
 @app.get("/workbench/cases/{case_id}/evidence/{evidence_id}/file")
 def workbench_evidence_file(
     case_id: str, evidence_id: str, download: int = 0
@@ -1916,14 +2154,11 @@ def workbench_evidence_file(
         raise _domain_http(exc) from exc
     headers = {}
     filename = evidence.original_filename or "evidence.bin"
-    if download:
-        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
-    else:
-        headers["Content-Disposition"] = f'inline; filename="{filename}"'
     return FileResponse(
         path,
         media_type=evidence.content_type or "application/octet-stream",
-        filename=filename if download else None,
+        filename=filename,
+        content_disposition_type="attachment" if download else "inline",
         headers=headers,
     )
 
@@ -1955,14 +2190,14 @@ def workbench_evidence_view(case_id: str, evidence_id: str) -> HTMLResponse:
     )
     if not path.is_file():
         # Stale DB row / moved storage — don't dump a bare 404 JSON page.
+        missing = "这份材料的原件在服务器上找不到了。"
+        if case.status not in FINISHED_CASE_STATUSES:
+            missing += "请回到案件，在对应清单项里重新从本地上传。"
         return HTMLResponse(
             render_evidence_view(
                 case,
                 evidence=evidence,
-                text_preview=(
-                    "这份材料的原件在服务器上找不到了（可能是之前的演示上传）。"
-                    "请回到案件，在对应清单项里重新从本地上传。"
-                ),
+                text_preview=missing,
                 can_inline_frame=False,
             ),
             status_code=404,
@@ -1972,33 +2207,37 @@ def workbench_evidence_view(case_id: str, evidence_id: str) -> HTMLResponse:
     name = (evidence.original_filename or "").lower()
     text_preview: str | None = None
     can_inline = False
-    data = path.read_bytes()
     if (
         ctype.startswith("text/")
         or name.endswith((".txt", ".csv", ".md", ".json", ".xml", ".html", ".htm"))
         or ctype in {"application/json", "application/xml"}
     ):
-        try:
-            text_preview = data.decode("utf-8")
-        except UnicodeDecodeError:
-            text_preview = data.decode("utf-8", errors="replace")
+        text_preview = path.read_text(encoding="utf-8", errors="replace")
     elif ctype.startswith("image/") or name.endswith(
         (".png", ".jpg", ".jpeg", ".gif", ".webp")
     ):
         can_inline = True
     elif ctype == "application/pdf" or name.endswith(".pdf"):
         can_inline = True
+    viewed = evidence.quarantine_status != "rejected" and (text_preview is not None or can_inline)
+    if viewed and not evidence.viewed_at:
+        mark_evidence_viewed(
+            database_url=settings.database_url, tenant_id=settings.tenant_id,
+            case_id=case_id, evidence_id=evidence_id,
+        )
     return HTMLResponse(
         render_evidence_view(
             case,
             evidence=evidence,
             text_preview=text_preview,
             can_inline_frame=can_inline,
-        )
+            viewed=viewed,
+        ),
+        headers={"Cache-Control": "no-store"},
     )
 
 
-@app.post("/workbench/cases/{case_id}/evidence")
+@_workbench_case_actions.post("/evidence")
 async def workbench_attach_evidence(
     case_id: str, request: Request
 ) -> RedirectResponse:
@@ -2014,6 +2253,7 @@ async def workbench_attach_evidence(
             )
         data = await upload.read()  # type: ignore[misc]
         filename = (getattr(upload, "filename", None) or "").strip() or "upload.bin"
+        translation_draft_id = str(form.get("translation_draft_id") or "").strip() or None
         content_type = (
             getattr(upload, "content_type", None) or "application/octet-stream"
         )
@@ -2030,28 +2270,34 @@ async def workbench_attach_evidence(
             expected_case_version=_parse_expected_version(
                 str(form.get("expected_case_version") or "") or None
             ),
+            translation_draft_id=translation_draft_id,
         )
         # Best-effort OCR so「查看」旁状态能更新；失败不挡上传。
-        try:
-            run_ocr_on_evidence(
-                database_url=settings.database_url,
-                tenant_id=settings.tenant_id,
-                case_id=case_id,
-                evidence_id=evidence.id,
-                file_store=store,
-                expected_case_version=evidence.case_version,
-            )
-        except DomainError:
-            pass
+        if not translation_draft_id:
+            try:
+                run_ocr_on_evidence(
+                    database_url=settings.database_url,
+                    tenant_id=settings.tenant_id,
+                    case_id=case_id,
+                    evidence_id=evidence.id,
+                    file_store=store,
+                    expected_case_version=evidence.case_version,
+                )
+            except DomainError:
+                pass
         msg = f"已上传：{filename}"
     except DomainError as exc:
         msg = str(exc)
     except Exception as exc:  # noqa: BLE001 — surface upload IO errors in flash
         msg = f"上传失败：{exc}"
+    if form.get("translation_draft_id"):
+        return RedirectResponse(
+            url=f"/workbench/cases/{case_id}?materials_msg={quote(msg)}#translation-materials", status_code=303,
+        )
     return _wb_redirect(case_id, msg)
 
 
-@app.post("/workbench/cases/{case_id}/evidence/{evidence_id}/annotations")
+@_workbench_case_actions.post("/evidence/{evidence_id}/annotations")
 async def workbench_annotate(
     case_id: str, evidence_id: str, request: Request
 ) -> RedirectResponse:
@@ -2076,7 +2322,7 @@ async def workbench_annotate(
     return _wb_redirect(case_id, msg)
 
 
-@app.post("/workbench/cases/{case_id}/evidence/{evidence_id}/ocr")
+@_workbench_case_actions.post("/evidence/{evidence_id}/ocr")
 async def workbench_run_ocr(
     case_id: str, evidence_id: str, request: Request
 ) -> RedirectResponse:
@@ -2103,7 +2349,7 @@ async def workbench_run_ocr(
     return _wb_redirect(case_id, msg)
 
 
-@app.post("/workbench/cases/{case_id}/bump-version")
+@_workbench_case_actions.post("/bump-version")
 async def workbench_bump(case_id: str, request: Request) -> RedirectResponse:
     form = await _form(request)
     settings = get_settings()
@@ -2121,7 +2367,7 @@ async def workbench_bump(case_id: str, request: Request) -> RedirectResponse:
         return _wb_redirect(case_id, str(exc))
 
 
-@app.post("/workbench/cases/{case_id}/receipt")
+@_workbench_case_actions.post("/receipt")
 async def workbench_receipt(case_id: str, request: Request) -> RedirectResponse:
     form = await _form(request)
     settings = get_settings()
@@ -2139,3 +2385,6 @@ async def workbench_receipt(case_id: str, request: Request) -> RedirectResponse:
     except DomainError as exc:
         msg = str(exc)
     return _wb_redirect(case_id, msg)
+
+
+app.include_router(_workbench_case_actions)

@@ -23,9 +23,12 @@ class SiliconFlowClient:
     api_key: str
     base_url: str
     timeout_s: float = 60.0
+    max_tokens: int = 1200
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> SiliconFlowClient:
+    def from_settings(
+        cls, settings: Settings, *, timeout_s: float = 60.0, max_tokens: int = 1200,
+    ) -> SiliconFlowClient:
         if not settings.model_configured:
             raise DomainError(
                 code=ErrorCode.VALIDATION_ERROR,
@@ -34,6 +37,8 @@ class SiliconFlowClient:
         return cls(
             api_key=settings.siliconflow_api_key,
             base_url=settings.siliconflow_base_url,
+            timeout_s=timeout_s,
+            max_tokens=max_tokens,
         )
 
     def complete(
@@ -52,7 +57,7 @@ class SiliconFlowClient:
                         "model": model,
                         "messages": messages,
                         "temperature": 0.2,
-                        "max_tokens": 1200,
+                        "max_tokens": self.max_tokens,
                         "stream": False,
                     },
                 )
@@ -75,3 +80,24 @@ class SiliconFlowClient:
                 code=ErrorCode.MODEL_OUTPUT_INVALID,
                 message="model provider returned non-JSON body",
             ) from exc
+
+
+def complete_json_locally(
+    messages: list[dict[str, str]], *, max_tokens: int = 1200, schema: dict | None = None,
+) -> dict[str, Any]:
+    """Use the installed local model for structured tasks when remote chat fails."""
+    try:
+        with httpx.Client(trust_env=False) as client:
+            response = client.post(
+                "http://127.0.0.1:11434/api/chat",
+                timeout=httpx.Timeout(45, connect=2),
+                json={
+                    "model": "qwen3-vl:2b-instruct", "stream": False, "format": schema or "json",
+                    "options": {"temperature": 0, "num_predict": max_tokens}, "messages": messages,
+                },
+            )
+            response.raise_for_status()
+            message = response.json()["message"]
+            return {"choices": [{"message": message}]}
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        raise DomainError(ErrorCode.SYSTEM_BLOCKED, "local model request failed") from exc

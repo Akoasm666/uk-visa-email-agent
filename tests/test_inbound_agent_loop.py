@@ -9,10 +9,15 @@ import email.mime.text
 import tempfile
 import unittest
 import uuid
+from dataclasses import replace
+from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import patch
 
+import psycopg
+
 from visa_agent.case_service.inbound_agent import process_customer_inbound
+from visa_agent.case_service.outreach import send_opening_outreach
 from visa_agent.case_service.service import (
     attribute_inbound_to_case,
     create_case,
@@ -20,6 +25,7 @@ from visa_agent.case_service.service import (
 )
 from visa_agent.config import Settings
 from visa_agent.document_pipeline.classify import classify_attachment
+from visa_agent.document_pipeline.ocr import SyntheticOcrProvider
 from visa_agent.document_pipeline.service import list_evidence
 from visa_agent.domain.enums import RouteCode
 from visa_agent.email_adapter.imap_poll import poll_imap_inbox
@@ -114,6 +120,95 @@ class ClassifyTests(unittest.TestCase):
 class InboundAgentLoopTests(unittest.TestCase):
     def setUp(self) -> None:
         apply_migrations(DB)
+        self.enterContext(patch("visa_agent.case_service.inbound_agent.default_ocr_provider",
+                                return_value=SyntheticOcrProvider()))
+
+    def test_imap_thread_routes_between_two_cases_for_same_sender(self) -> None:
+        customer = "customer@example.com"
+        outsider = "outsider@example.com"
+        settings = replace(
+            _settings(allowlist=frozenset({customer, outsider})),
+            tenant_id=uuid.uuid4().hex,
+            email_smtp_host="smtp.example.com",
+            email_smtp_user="agent@example.com",
+            email_smtp_password="test",
+        )
+        primary, sibling, unrelated = [
+            create_case(
+                database_url=DB,
+                tenant_id=settings.tenant_id,
+                title=f"Thread case {index}",
+                customer_email=sender,
+                route=RouteCode.STANDARD_VISITOR,
+            )
+            for index, sender in enumerate((customer, customer, outsider))
+        ]
+        store = LocalFileStore(settings.file_storage_dir)
+        with patch("visa_agent.email_adapter.smtp_client.smtplib.SMTP") as smtp:
+            server = smtp.return_value.__enter__.return_value
+            server.send_message.return_value = {}
+            self.assertTrue(send_opening_outreach(settings=settings, case=primary).sent)
+            self.assertTrue(send_opening_outreach(settings=settings, case=sibling).sent)
+            first, second = [call.args[0] for call in server.send_message.call_args_list]
+            primary_id = str(first["Message-ID"])
+            sibling_id = str(second["Message-ID"])
+            self.assertTrue(primary_id)
+            self.assertNotEqual(primary_id, sibling_id)
+            subject = f"Re: {first['Subject']}"
+
+            def customer_reply(uid, sender, parent, references=None):  # noqa: ANN001
+                mail = EmailMessage()
+                mail["From"] = sender
+                mail["To"] = settings.email_from
+                mail["Subject"] = subject
+                mail["Message-ID"] = f"<thread-{uid}-{settings.tenant_id}@example.com>"
+                if parent:
+                    mail["In-Reply-To"] = parent
+                if references:
+                    mail["References"] = references
+                mail.set_content("Please find attached.")
+                return mail.as_bytes()
+
+            imap = FakeImapUidClient({
+                "1": customer_reply("1", customer, primary_id),
+                "2": customer_reply("2", outsider, primary_id),
+                "3": customer_reply("3", customer, primary_id, sibling_id),
+                "4": customer_reply("4", outsider, "<unknown@example.com>"),
+                "5": customer_reply("5", customer, None),
+                "6": customer_reply("6", customer, None, sibling_id),
+            })
+            result = poll_imap_inbox(
+                settings=settings, file_store=store, client=imap, uidvalidity="1"
+            )
+            self.assertTrue(result.success)
+            self.assertEqual(result.count, 6)
+            self.assertEqual(server.send_message.call_count, 4)
+            agent_reply = server.send_message.call_args_list[2].args[0]
+            customer_id = f"<thread-1-{settings.tenant_id}@example.com>"
+            self.assertEqual(str(agent_reply["In-Reply-To"]), customer_id)
+            self.assertEqual(str(agent_reply["References"]), f"{primary_id} {customer_id}")
+            self.assertEqual(str(agent_reply["Subject"]), subject)
+            self.assertIsNotNone(agent_reply["Message-ID"])
+
+            with psycopg.connect(DB) as conn:
+                case_ids = [
+                    conn.execute(
+                        "SELECT case_id FROM email_events WHERE tenant_id = %s AND id = %s",
+                        (settings.tenant_id, message.email_event_id),
+                    ).fetchone()[0]
+                    for message in result.messages
+                ]
+                reply_row = conn.execute(
+                    """
+                    SELECT case_id, in_reply_to, email_references
+                    FROM email_events
+                    WHERE tenant_id = %s AND rfc_message_id = %s
+                    """,
+                    (settings.tenant_id, str(agent_reply["Message-ID"])),
+                ).fetchone()
+            self.assertEqual(case_ids, [primary.id, None, None, None, None, sibling.id])
+            self.assertEqual(reply_row, (primary.id, customer_id, f"{primary_id} {customer_id}"))
+            self.assertNotIn(unrelated.id, case_ids)
 
     def test_attach_classify_reply_and_mark_processed(self) -> None:
         email_addr = f"loop-{uuid.uuid4().hex[:8]}@example.com"
@@ -290,7 +385,13 @@ class InboundAgentLoopTests(unittest.TestCase):
         msg["To"] = "agent@example.com"
         msg["Subject"] = "passport attached"
         msg["Message-ID"] = f"<imap-{uuid.uuid4().hex}@example.com>"
-        msg.attach(email.mime.text.MIMEText("Please find attached.", "plain"))
+        msg.attach(email.mime.text.MIMEText(
+            "Please find attached the clearer scan of the passport bio-data page.\n\n"
+            "On Monday, 16 November, Agent <agent@example.com> wrote:\n"
+            "When can you send a clearer scan?\n"
+            "> What else can we help with?\n",
+            "plain",
+        ))
         part = email.mime.application.MIMEApplication(
             b"%PDF-1.4 passport scan bytes", Name="passport.pdf"
         )
@@ -299,9 +400,12 @@ class InboundAgentLoopTests(unittest.TestCase):
         raw = msg.as_bytes()
 
         client = FakeImapUidClient({"501": raw})
-        with patch(
-            "visa_agent.case_service.inbound_agent.enqueue_and_maybe_send",
-            side_effect=_fake_outbox,
+        with (
+            patch(
+                "visa_agent.case_service.inbound_agent.enqueue_and_maybe_send",
+                side_effect=_fake_outbox,
+            ),
+            patch("visa_agent.case_service.inbound_agent.answer_customer_question") as qa,
         ):
             result = poll_imap_inbox(
                 settings=settings,
@@ -310,6 +414,7 @@ class InboundAgentLoopTests(unittest.TestCase):
                 client=client,
                 uidvalidity="1",
             )
+        qa.assert_not_called()
         self.assertEqual(result.count, 1)
         self.assertTrue(result.success)
         evidence = list_evidence(

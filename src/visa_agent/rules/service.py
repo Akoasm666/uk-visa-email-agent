@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -10,10 +11,14 @@ from datetime import date
 import psycopg
 
 from visa_agent.case_service.service import (
+    FINISHED_CASE_STATUSES,
+    CaseRecord,
+    _require_version,
     bump_case_version_in_conn,
     get_case,
 )
-from visa_agent.domain.enums import ErrorCode, RequirementStatus, RouteCode
+from visa_agent.document_pipeline.classify import requirement_for_classification
+from visa_agent.domain.enums import CaseStatus, ErrorCode, RequirementStatus, RouteCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.rules.seed import (
     GRADUATE_PACK_ID,
@@ -54,39 +59,14 @@ _PASS_STATUSES = frozenset(
         RequirementStatus.EXEMPTED_WITH_BASIS.value,
     }
 )
+_CONDITIONAL_REQUIREMENTS = frozenset({
+    "sponsor_if_any", "translation_if_needed", "tuberculosis_test_if_required",
+})
+CHECKLIST_READ_ONLY_STATUSES = FINISHED_CASE_STATUSES | {CaseStatus.SENT_AWAITING_ACK}
 
-# Evidence classifications that weakly map to requirement themes (demo heuristic).
-_CLASSIFICATION_HINTS: dict[str, str] = {
-    # Visitor
-    "passport": "passport_valid",
-    "bank": "funds_for_stay",
-    "funds": "funds_for_stay",
-    "sponsor": "sponsor_if_any",
-    "translation": "translation_if_needed",
-    "itinerary": "intention_to_leave",
-    "employment": "home_ties",
-    "purpose": "visit_purpose_allowed",
-    # Student
-    "cas": "cas_confirmation",
-    "maintenance": "funds_maintenance",
-    "course": "course_offer",
-    "offer": "course_offer",
-    # Skilled Worker
-    "cos": "certificate_of_sponsorship",
-    "sponsorship": "certificate_of_sponsorship",
-    "salary": "salary_threshold",
-    "skill": "job_skill_level",
-    # Shared Student / SW
-    "english": "english_language",
-    "tb": "tuberculosis_test_if_required",
-    "tuberculosis": "tuberculosis_test_if_required",
-    # Graduate
-    "degree": "qualification_confirmed",
-    "qualification": "qualification_confirmed",
-    "graduation": "uk_study_completed",
-    "uk_study": "uk_study_completed",
-    "permission": "current_permission_basis",
-}
+
+def can_judge_applicability(requirement_key: str, severity: str) -> bool:
+    return requirement_key in _CONDITIONAL_REQUIREMENTS or severity == "transfer_human"
 
 _SEED_LOCK_K1 = 920522
 _SEED_LOCK_K2 = 1
@@ -122,6 +102,8 @@ class CaseRequirementState:
     pack_id: str
     pack_version: int
     case_version: int
+    applicability_decision: str = ""
+    applicability_note: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -626,7 +608,7 @@ def _hint_status_for_requirement(
         )
 
     matched_class = any(
-        _CLASSIFICATION_HINTS.get(c) == requirement_key for c in classifications
+        requirement_for_classification(c, route=route) == requirement_key for c in classifications
     )
     matched_ann = requirement_key in annotation_keys or any(
         a.startswith(requirement_key) for a in annotation_keys
@@ -641,20 +623,10 @@ def _hint_status_for_requirement(
             RequirementStatus.RECEIVED_PENDING_REVIEW.value,
             "matching evidence classification present; pending review",
         )
-    if requirement_key == "sponsor_if_any" and "sponsor" not in classifications:
+    if requirement_key in _CONDITIONAL_REQUIREMENTS:
         return (
             RequirementStatus.APPLICABILITY_UNKNOWN.value,
-            "sponsor applicability unknown without evidence or annotation",
-        )
-    if (
-        requirement_key == "tuberculosis_test_if_required"
-        and "tb" not in classifications
-        and "tuberculosis" not in classifications
-        and requirement_key not in annotation_keys
-    ):
-        return (
-            RequirementStatus.APPLICABILITY_UNKNOWN.value,
-            "TB applicability unknown without evidence or annotation",
+            "applicability unknown without evidence, annotation or advisor decision",
         )
     return (
         RequirementStatus.APPLICABLE_MISSING.value,
@@ -673,14 +645,172 @@ def _is_blocking(*, severity: str, status: str) -> bool:
     return False
 
 
+def _load_checklist_pack(
+    conn: psycopg.Connection,
+    *,
+    database_url: str,
+    case: CaseRecord,
+    binding: tuple[str, int] | None,
+    preview_unbound: bool,
+) -> RulePack:
+    if binding is None:
+        if not preview_unbound or case.route is None:
+            raise DomainError(
+                ErrorCode.VALIDATION_ERROR,
+                "case has no active rule pack; bind a published pack first",
+            )
+        pack_id, pack_version = default_pack_for_route(case.route)
+    else:
+        pack_id, pack_version = binding
+    pack = get_rule_pack(
+        database_url=database_url, pack_id=pack_id, pack_version=pack_version, conn=conn,
+    )
+    if binding is not None and not pack.published:
+        raise DomainError(ErrorCode.VALIDATION_ERROR, "cannot evaluate against an unpublished rule pack")
+    case_route = case.route.value if case.route else ""
+    if pack.route != case_route:
+        raise DomainError(
+            ErrorCode.VALIDATION_ERROR, "active rule pack route does not match case route",
+            details=(pack.route, case_route),
+        )
+    if not pack.requirements:
+        raise DomainError(
+            ErrorCode.VALIDATION_ERROR, "active rule pack has no requirements",
+            details=(pack.pack_id, str(pack.pack_version)),
+        )
+    return pack
+
+
+def record_requirement_applicability(
+    *,
+    database_url: str,
+    tenant_id: str,
+    case_id: str,
+    requirement_key: str,
+    decision: str,
+    note: str,
+    expected_case_version: int | None,
+) -> None:
+    if decision not in {"", "applies", "not_applicable"}:
+        raise DomainError(ErrorCode.VALIDATION_ERROR, "请选择有效的判断结果")
+    with psycopg.connect(database_url) as conn:
+        case = get_case(
+            database_url=database_url, tenant_id=tenant_id, case_id=case_id,
+            conn=conn, for_update=True,
+        )
+        _require_version(case, expected_case_version, required=True)
+        if case.status in CHECKLIST_READ_ONLY_STATUSES:
+            raise DomainError(ErrorCode.VALIDATION_ERROR, "已发送或关闭的案件不能修改材料判断")
+        pack = _load_checklist_pack(
+            conn, database_url=database_url, case=case, preview_unbound=True,
+            binding=_load_case_pack_binding(conn, tenant_id=tenant_id, case_id=case_id),
+        )
+        req = next((req for req in pack.requirements if req.key == requirement_key), None)
+        if req is None or not can_judge_applicability(req.key, req.severity):
+            raise DomainError(ErrorCode.VALIDATION_ERROR, "此项目无需手动判断是否适用")
+        keys = (tenant_id, case_id, pack.pack_id, pack.pack_version, requirement_key)
+        if decision:
+            changed = conn.execute(
+                """
+                INSERT INTO case_requirement_applicability AS a (
+                    tenant_id, case_id, pack_id, pack_version, requirement_key, decision, note
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (tenant_id, case_id, pack_id, pack_version, requirement_key)
+                DO UPDATE SET decision = EXCLUDED.decision, note = EXCLUDED.note, updated_at = NOW()
+                WHERE (a.decision, a.note) IS DISTINCT FROM (EXCLUDED.decision, EXCLUDED.note)
+                """,
+                (*keys, decision, note.strip()),
+            ).rowcount
+        else:
+            changed = conn.execute(
+                """
+                DELETE FROM case_requirement_applicability
+                WHERE tenant_id = %s AND case_id = %s AND pack_id = %s
+                  AND pack_version = %s AND requirement_key = %s
+                """,
+                keys,
+            ).rowcount
+        if changed:
+            sending = conn.execute(
+                """
+                SELECT 1 FROM outbox_messages
+                WHERE tenant_id = %s AND case_id = %s AND status = 'processing'
+                LIMIT 1
+                """,
+                (tenant_id, case_id),
+            ).fetchone()
+            if sending:
+                raise DomainError(ErrorCode.VALIDATION_ERROR, "案件正在发信，请稍后再修改判断")
+            bump_case_version_in_conn(
+                conn=conn, database_url=database_url, tenant_id=tenant_id, case_id=case_id,
+                expected_case_version=case.case_version,
+            )
+
+
+def _checklist_evidence(
+    conn: psycopg.Connection, tenant_id: str, case_id: str,
+) -> list[tuple[str, str, int, int | None, str | None]]:
+    return conn.execute(
+        """
+        SELECT id, classification, case_version, advisor_reviewed_version, translation_source_id
+        FROM case_evidence
+        WHERE tenant_id = %s AND case_id = %s
+          AND quarantine_status <> 'rejected' AND deleted_at IS NULL
+        """,
+        (tenant_id, case_id),
+    ).fetchall()
+
+
+def record_requirement_review(
+    *, database_url: str, tenant_id: str, case_id: str, requirement_key: str,
+    expected_case_version: int | None,
+) -> None:
+    with psycopg.connect(database_url) as conn:
+        keys = dict(database_url=database_url, tenant_id=tenant_id, case_id=case_id)
+        case = get_case(**keys, conn=conn, for_update=True)
+        _require_version(case, expected_case_version, required=True)
+        if case.status in CHECKLIST_READ_ONLY_STATUSES:
+            raise DomainError(ErrorCode.VALIDATION_ERROR, "已发送或结束的案件仅可查看")
+        evaluation = evaluate_case_requirements(**keys, conn=conn, preview_unbound=True, persist_states=False)
+        state = next((state for state in evaluation.states if state.requirement_key == requirement_key), None)
+        evidence = _checklist_evidence(conn, tenant_id, case_id)
+        ids = [
+            evidence_id for evidence_id, classification, _, _, _ in evidence
+            if requirement_for_classification(classification, route=case.route) == requirement_key
+        ]
+        if state and state.status == RequirementStatus.EVIDENCE_ACCEPTED.value:
+            return
+        reviewable = {RequirementStatus.RECEIVED_PENDING_REVIEW.value}
+        if requirement_key == "translation_if_needed":
+            reviewable.update({RequirementStatus.APPLICABLE_MISSING.value, RequirementStatus.EVIDENCE_ACCEPTED.value})
+        if state is None or state.status not in reviewable:
+            raise DomainError(ErrorCode.VALIDATION_ERROR, "此项材料当前不可核对通过")
+        if not ids:
+            if requirement_key == "translation_if_needed":
+                raise DomainError(ErrorCode.VALIDATION_ERROR, "请先上传译者核签后的 PDF")
+            raise DomainError(ErrorCode.VALIDATION_ERROR, "此项材料没有可核对的文件")
+        conn.execute(
+            """
+            UPDATE case_evidence SET advisor_reviewed_version = case_version,
+                quarantine_status = 'accepted_for_review'
+            WHERE tenant_id = %s AND case_id = %s AND id = ANY(%s)
+            """,
+            (tenant_id, case_id, ids),
+        )
+
+
 def evaluate_case_requirements(
     *,
     database_url: str,
     tenant_id: str,
     case_id: str,
+    preview_unbound: bool = False,
+    persist_states: bool = True,
+    conn: psycopg.Connection | None = None,
+    package_evidence_ids: tuple[str, ...] | None = None,
 ) -> EvaluationResult:
-    """Formal evaluate against the case's currently bound published pack only."""
-    with psycopg.connect(database_url) as conn:
+    """Evaluate the bound pack, with a read-only seed preview for the workbench."""
+    with (nullcontext(conn) if conn is not None else psycopg.connect(database_url)) as conn:
         with conn.transaction():
             case = get_case(
                 database_url=database_url,
@@ -692,48 +822,35 @@ def evaluate_case_requirements(
             binding = _load_case_pack_binding(
                 conn, tenant_id=tenant_id, case_id=case_id
             )
-            if binding is None:
-                raise DomainError(
-                    code=ErrorCode.VALIDATION_ERROR,
-                    message="case has no active rule pack; bind a published pack first",
-                )
-            pack_id, pack_version = binding
-            pack = get_rule_pack(
-                database_url=database_url,
-                pack_id=pack_id,
-                pack_version=pack_version,
-                conn=conn,
+            pack = _load_checklist_pack(
+                conn, database_url=database_url, case=case, binding=binding,
+                preview_unbound=preview_unbound,
             )
-            if not pack.published:
-                raise DomainError(
-                    code=ErrorCode.VALIDATION_ERROR,
-                    message="cannot evaluate against an unpublished rule pack",
+            pack_id, pack_version = pack.pack_id, pack.pack_version
+            decisions = {
+                key: (decision, note)
+                for key, decision, note in conn.execute(
+                    """
+                    SELECT requirement_key, decision, note FROM case_requirement_applicability
+                    WHERE tenant_id = %s AND case_id = %s AND pack_id = %s AND pack_version = %s
+                    """,
+                    (tenant_id, case_id, pack_id, pack_version),
                 )
-            case_route = case.route.value if case.route else None
-            if case_route is None or pack.route != case_route:
-                raise DomainError(
-                    code=ErrorCode.VALIDATION_ERROR,
-                    message="active rule pack route does not match case route",
-                    details=(pack.route, case_route or ""),
-                )
-            if not pack.requirements:
-                raise DomainError(
-                    code=ErrorCode.VALIDATION_ERROR,
-                    message="active rule pack has no requirements",
-                    details=(pack.pack_id, str(pack.pack_version)),
-                )
-
-            class_rows = conn.execute(
-                """
-                SELECT classification FROM case_evidence
-                WHERE tenant_id = %s AND case_id = %s
-                  AND quarantine_status <> 'rejected'
-                """,
-                (tenant_id, case_id),
-            ).fetchall()
-            classifications = {
-                (r[0] or "unclassified").strip().lower() for r in class_rows
             }
+
+            classifications: set[str] = set()
+            file_reviews: dict[str, list[bool]] = {}
+            standalone_translation = False
+            package_ids = set(package_evidence_ids) if package_evidence_ids is not None else None
+            for evidence_id, classification, version, reviewed, source_id in _checklist_evidence(conn, tenant_id, case_id):
+                if package_ids is not None and evidence_id not in package_ids:
+                    continue
+                classification = (classification or "unclassified").strip().lower()
+                classifications.add(classification)
+                if classification == "translation" and source_id is None:
+                    standalone_translation = True
+                if key := requirement_for_classification(classification, route=case.route):
+                    file_reviews.setdefault(key, []).append(reviewed == version)
             remediation_rows = conn.execute(
                 """
                 SELECT requirement_key, reason_detail
@@ -750,18 +867,23 @@ def evaluate_case_requirements(
             }
             ann_rows = conn.execute(
                 """
-                SELECT a.field_key, a.field_value
+                SELECT a.field_key, a.field_value, e.id
                 FROM evidence_annotations a
                 JOIN case_evidence e
                   ON e.tenant_id = a.tenant_id
                  AND e.id = a.evidence_id
                  AND e.case_id = a.case_id
                 WHERE a.tenant_id = %s AND a.case_id = %s
-                  AND e.quarantine_status <> 'rejected'
+                  AND e.quarantine_status <> 'rejected' AND e.deleted_at IS NULL
                 """,
                 (tenant_id, case_id),
             ).fetchall()
-            from visa_agent.rules.visitor_pack import AnnotationPair
+            # Apply case-wide risk annotations even when their source is not
+            # included in this particular delivery.
+            from visa_agent.rules.visitor_pack import AnnotationPair, is_transfer_key
+
+            if package_ids is not None:
+                ann_rows = [row for row in ann_rows if row[2] in package_ids or is_transfer_key(row[0])]
 
             annotation_keys = {(r[0] or "").strip().lower() for r in ann_rows}
             annotation_pairs = [
@@ -776,7 +898,7 @@ def evaluate_case_requirements(
             binding_now = _load_case_pack_binding(
                 conn, tenant_id=tenant_id, case_id=case_id
             )
-            if binding_now != (pack_id, pack_version):
+            if binding_now != binding:
                 raise DomainError(
                     code=ErrorCode.CONFLICT_VERSION,
                     message="active rule pack changed during evaluation",
@@ -795,6 +917,15 @@ def evaluate_case_requirements(
 
             states: list[CaseRequirementState] = []
             blocking: list[str] = []
+            from visa_agent.case_service.visitor_purpose import PURPOSE_LABELS, get_stated_visitor_purpose
+            from visa_agent.case_service.translations import case_translation_languages
+
+            visitor = case.route == RouteCode.STANDARD_VISITOR
+            purpose = get_stated_visitor_purpose(conn, tenant_id, case_id) if visitor else None
+            translation_languages = (
+                case_translation_languages(conn, tenant_id, case_id, included_ids=package_evidence_ids)
+                if visitor else []
+            )
             for req in pack.requirements:
                 status, reason = _hint_status_for_requirement(
                     requirement_key=req.key,
@@ -805,12 +936,46 @@ def evaluate_case_requirements(
                     pack_version=pack.pack_version,
                     route=pack.route,
                 )
+                decision, note = decisions.get(req.key, ("", ""))
+                reviews = file_reviews.get(req.key)
+                if req.key == "visit_purpose_allowed" and purpose:
+                    if purpose == "unclear":
+                        status = RequirementStatus.NEEDS_CORRECTION.value
+                        reason = "客户邮件中的访问目的有歧义"
+                    elif status == RequirementStatus.APPLICABLE_MISSING.value:
+                        status = RequirementStatus.RECEIVED_PENDING_REVIEW.value
+                        reason = f"{PURPOSE_LABELS[purpose]}（来自客户邮件）"
+                if req.key == "translation_if_needed" and visitor:
+                    if (
+                        "translation_needed" in translation_languages and not standalone_translation
+                    ):
+                        status = RequirementStatus.APPLICABLE_MISSING.value
+                        reason = "非英文原件需提供译文供顾问核对"
+                    elif ("translation" not in classifications and translation_languages
+                          and all(lang == "english" for lang in translation_languages)):
+                        status = RequirementStatus.NOT_APPLICABLE.value
+                        reason = "已收支持文件的 OCR 显示为英文"
+                if decision and status != RequirementStatus.NEEDS_CORRECTION.value:
+                    if decision == "not_applicable":
+                        status = RequirementStatus.NOT_APPLICABLE.value
+                        reason = note or "advisor marked not applicable"
+                    elif req.severity == "transfer_human":
+                        status = RequirementStatus.NEEDS_CORRECTION.value
+                        reason = note or "advisor identified a transfer-to-human trigger"
+                    elif status == RequirementStatus.APPLICABILITY_UNKNOWN.value or (
+                        req.key == "translation_if_needed" and status == RequirementStatus.NOT_APPLICABLE.value
+                    ):
+                        status = RequirementStatus.APPLICABLE_MISSING.value
+                        reason = "advisor marked applicable; awaiting supporting evidence"
                 if req.key in open_remediations:
                     status = RequirementStatus.NEEDS_CORRECTION.value
                     reason = (
                         open_remediations[req.key]
                         or "open remediation: awaiting clearer re-upload"
                     )
+                if status == RequirementStatus.RECEIVED_PENDING_REVIEW.value and reviews and all(reviews):
+                    status = RequirementStatus.EVIDENCE_ACCEPTED.value
+                    reason = "supporting files reviewed by advisor"
                 states.append(
                     CaseRequirementState(
                         requirement_key=req.key,
@@ -820,12 +985,14 @@ def evaluate_case_requirements(
                         pack_id=pack.pack_id,
                         pack_version=pack.pack_version,
                         case_version=case.case_version,
+                        applicability_decision=decision,
+                        applicability_note=note,
                     )
                 )
                 if _is_blocking(severity=req.severity, status=status):
                     blocking.append(req.key)
 
-            for st in states:
+            for st in states if binding is not None and persist_states and package_ids is None else ():
                 conn.execute(
                     """
                     INSERT INTO case_requirement_states (

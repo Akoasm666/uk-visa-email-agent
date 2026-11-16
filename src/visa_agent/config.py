@@ -32,7 +32,9 @@ _FILE_BACKED_KEYS = frozenset(
         "EMAIL_IMAP_PORT",
         "EMAIL_IMAP_USER",
         "EMAIL_IMAP_PASSWORD",
+        "EMAIL_IMAP_CASE_THREADS_ONLY",
         "EMAIL_OUTBOUND_ALLOWLIST",
+        "EMAIL_PROXY_URL",
         "RULE_PUBLISH_TOKEN",
     }
 )
@@ -87,6 +89,8 @@ class Settings:
     email_imap_password: str
     outbound_allowlist: frozenset[str]
     rule_publish_token: str
+    email_proxy_url: str = ""
+    email_imap_case_threads_only: bool = False
 
     @property
     def rule_publish_enabled(self) -> bool:
@@ -117,6 +121,9 @@ class Settings:
 def get_settings(env_path: Path | None = None) -> Settings:
     path = env_path or DEFAULT_ENV_PATH
     file_vals = parse_dotenv_file(path)
+    thread_filter = _value(file_vals, "EMAIL_IMAP_CASE_THREADS_ONLY", "false").lower()
+    if thread_filter not in {"true", "false"}:
+        raise ValueError("EMAIL_IMAP_CASE_THREADS_ONLY must be true or false")
 
     storage = Path(
         _value(file_vals, "FILE_STORAGE_DIR", str(ROOT / "data" / "files"))
@@ -150,6 +157,8 @@ def get_settings(env_path: Path | None = None) -> Settings:
         outbound_allowlist=_split_allowlist(
             _value(file_vals, "EMAIL_OUTBOUND_ALLOWLIST", "")
         ),
+        email_proxy_url=_value(file_vals, "EMAIL_PROXY_URL", ""),
+        email_imap_case_threads_only=thread_filter == "true",
         # Empty by default — publish stays closed until an admin token is set.
         rule_publish_token=_value(file_vals, "RULE_PUBLISH_TOKEN", ""),
     )

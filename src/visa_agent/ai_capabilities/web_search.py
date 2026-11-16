@@ -193,19 +193,34 @@ def duckduckgo_search(
     return tuple(hits)
 
 
-def score_research_confidence(hits: tuple[SearchHit, ...] | list[SearchHit]) -> float:
-    """Aggregate confidence from ranked hits (gov.uk + agreement boost)."""
+_EVIDENCE_TOPICS = (
+    (r"资金|流水|存款|余额|\b(?:funds|savings|money|bank|balance|support yourself)\b",
+     r"资金|流水|存款|\b(?:funds|savings|financial evidence|bank statements?|support yourself|support themselves)\b"),
+    (r"多久.{0,8}出签|出签|审理|processing time|decision time|how long.{0,25}decision",
+     r"办理时间|\b(?:processing times?|working days|weeks?|get a decision)\b"),
+    (r"护照|资料页|\bpassport\b", r"护照|\b(?:passport|travel document)\b"),
+    (r"翻译|译文|\btranslat", r"翻译|\btranslat"),
+    (r"担保|资助|\b(?:sponsor|sponsorship)\b", r"担保|资助|\b(?:sponsor|sponsorship|third party)\b"),
+    (r"费用|多少钱|\b(?:fees?|charge)\b", r"费用|\b(?:fees?|charges?|costs?)\b|£\s*\d"),
+    (r"预约|生物识别|指纹|\b(?:biometric|appointment)\b", r"预约|\b(?:biometric|appointment)"),
+)
+
+
+def score_research_confidence(
+    hits: tuple[SearchHit, ...] | list[SearchHit], *, question: str = "",
+) -> float:
+    """Require excerpt relevance before publisher authority can clear an answer."""
     if not hits:
         return 0.0
-    ranked = sorted(hits, key=lambda h: h.authority, reverse=True)
-    top = ranked[0].authority
-    if len(ranked) >= 2:
-        # Mild boost when a second source also scores reasonably.
-        top = min(0.99, top + 0.08 * ranked[1].authority)
-    has_gov = any("gov.uk" in (h.url or "") for h in ranked[:3])
-    if has_gov:
-        top = min(0.99, top + 0.05)
-    return round(top, 3)
+    official = [hit for hit in hits if host_authority(hit.url) >= 0.85 and hit.snippet.strip()]
+    if not official:
+        return 0.0
+    topics = [match for ask, match in _EVIDENCE_TOPICS if re.search(ask, question, re.I)]
+    if not topics or not all(
+        any(re.search(topic, hit.snippet, re.I) for hit in official) for topic in topics
+    ):
+        return 0.0
+    return round(max(host_authority(hit.url) for hit in official), 3)
 
 
 def build_visa_search_query(question: str, *, route: str | None) -> str:

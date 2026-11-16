@@ -41,6 +41,12 @@ ALTER TABLE email_events
 ALTER TABLE email_events ADD COLUMN IF NOT EXISTS processing_conclusion TEXT;
 ALTER TABLE email_events ADD COLUMN IF NOT EXISTS processed_by TEXT;
 ALTER TABLE email_events ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;
+ALTER TABLE email_events ADD COLUMN IF NOT EXISTS in_reply_to TEXT;
+ALTER TABLE email_events ADD COLUMN IF NOT EXISTS email_references TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_email_events_rfc_message_id
+    ON email_events (tenant_id, rfc_message_id)
+    WHERE rfc_message_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_email_events_created
     ON email_events (tenant_id, created_at DESC);
@@ -72,6 +78,13 @@ CREATE INDEX IF NOT EXISTS idx_outbox_status
 -- Compatible upgrades for databases created by earlier S1.2 schema
 ALTER TABLE email_events ADD COLUMN IF NOT EXISTS claimed_case_id TEXT;
 ALTER TABLE outbox_messages ADD COLUMN IF NOT EXISTS send_operation_id TEXT;
+ALTER TABLE outbox_messages ADD COLUMN IF NOT EXISTS rfc_message_id TEXT;
+ALTER TABLE outbox_messages ADD COLUMN IF NOT EXISTS in_reply_to TEXT;
+ALTER TABLE outbox_messages ADD COLUMN IF NOT EXISTS email_references TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_rfc_message_id
+    ON outbox_messages (tenant_id, rfc_message_id)
+    WHERE rfc_message_id IS NOT NULL;
 UPDATE outbox_messages
 SET send_operation_id = id
 WHERE send_operation_id IS NULL;
@@ -117,6 +130,15 @@ CREATE TABLE IF NOT EXISTS cases (
 );
 
 ALTER TABLE cases ADD COLUMN IF NOT EXISTS closure_seq INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS case_terminations (
+    tenant_id TEXT NOT NULL,
+    case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    closure_seq INTEGER NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, case_id, closure_seq)
+);
 ALTER TABLE cases ADD COLUMN IF NOT EXISTS final_review_seq INTEGER NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_cases_tenant_updated
@@ -278,14 +300,30 @@ CREATE TABLE IF NOT EXISTS case_evidence (
         CHECK (quarantine_status IN ('isolated', 'rejected', 'accepted_for_review')),
     rejection_reason TEXT NOT NULL DEFAULT '',
     source_email_event_id TEXT,
+    viewed_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE case_evidence ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE case_evidence ADD COLUMN IF NOT EXISTS viewed_at TIMESTAMPTZ;
+ALTER TABLE case_evidence ADD COLUMN IF NOT EXISTS advisor_reviewed_version INTEGER;
+ALTER TABLE case_evidence ADD COLUMN IF NOT EXISTS translation_source_id TEXT REFERENCES case_evidence(id);
+ALTER TABLE case_evidence ADD COLUMN IF NOT EXISTS translation_checked_at TIMESTAMPTZ;
+ALTER TABLE case_evidence ADD COLUMN IF NOT EXISTS document_language TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS case_evidence_active_translation_source
+    ON case_evidence (tenant_id, case_id, translation_source_id)
+    WHERE translation_source_id IS NOT NULL AND deleted_at IS NULL;
+ALTER TABLE outbox_messages ADD COLUMN IF NOT EXISTS attachment_evidence_id TEXT;
+ALTER TABLE outbox_messages ADD COLUMN IF NOT EXISTS attachment_evidence_ids TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE outbox_messages ADD COLUMN IF NOT EXISTS body_html TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_case_evidence_case
     ON case_evidence (tenant_id, case_id, created_at DESC);
 
-CREATE UNIQUE INDEX IF NOT EXISTS case_evidence_sha_per_case
-    ON case_evidence (tenant_id, case_id, content_sha256);
+CREATE UNIQUE INDEX IF NOT EXISTS case_evidence_active_sha_per_case
+    ON case_evidence (tenant_id, case_id, content_sha256) WHERE deleted_at IS NULL;
+DROP INDEX IF EXISTS case_evidence_sha_per_case;
 
 CREATE TABLE IF NOT EXISTS evidence_annotations (
     id TEXT PRIMARY KEY,
@@ -369,6 +407,20 @@ CREATE TABLE IF NOT EXISTS case_requirement_states (
 CREATE INDEX IF NOT EXISTS idx_case_requirement_states_case
     ON case_requirement_states (tenant_id, case_id, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS case_requirement_applicability (
+    tenant_id TEXT NOT NULL,
+    case_id TEXT NOT NULL REFERENCES cases(id),
+    pack_id TEXT NOT NULL,
+    pack_version INTEGER NOT NULL,
+    requirement_key TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('applies', 'not_applicable')),
+    note TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, case_id, pack_id, pack_version, requirement_key),
+    FOREIGN KEY (pack_id, pack_version, requirement_key)
+        REFERENCES rule_requirements (pack_id, pack_version, requirement_key)
+);
+
 ALTER TABLE cases ADD COLUMN IF NOT EXISTS active_pack_id TEXT;
 ALTER TABLE cases ADD COLUMN IF NOT EXISTS active_pack_version INTEGER;
 
@@ -410,6 +462,43 @@ CREATE TABLE IF NOT EXISTS open_questions (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     closed_at TIMESTAMPTZ
 );
+
+CREATE TABLE IF NOT EXISTS case_visitor_purposes (
+    tenant_id TEXT NOT NULL,
+    case_id TEXT NOT NULL REFERENCES cases(id),
+    email_event_id TEXT NOT NULL REFERENCES email_events(id),
+    purpose TEXT NOT NULL CHECK (purpose IN ('tourism', 'family_visit', 'business', 'unclear')),
+    PRIMARY KEY (tenant_id, case_id)
+);
+
+CREATE TABLE IF NOT EXISTS case_itinerary_requests (
+    tenant_id TEXT NOT NULL,
+    case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    start_date DATE,
+    duration_days INTEGER CHECK (duration_days BETWEEN 1 AND 366),
+    awaiting_details BOOLEAN NOT NULL,
+    source_email_event_id TEXT NOT NULL,
+    draft_text TEXT NOT NULL DEFAULT '',
+    draft_version INTEGER NOT NULL DEFAULT 0,
+    draft_source_email_event_id TEXT,
+    draft_evidence_id TEXT,
+    draft_message_id TEXT,
+    confirmed_at TIMESTAMPTZ,
+    last_reply_text TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (tenant_id, case_id)
+);
+
+ALTER TABLE case_itinerary_requests ADD COLUMN IF NOT EXISTS draft_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE case_itinerary_requests ADD COLUMN IF NOT EXISTS draft_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE case_itinerary_requests ADD COLUMN IF NOT EXISTS draft_source_email_event_id TEXT;
+ALTER TABLE case_itinerary_requests ADD COLUMN IF NOT EXISTS draft_evidence_id TEXT;
+ALTER TABLE case_itinerary_requests ADD COLUMN IF NOT EXISTS draft_message_id TEXT;
+ALTER TABLE case_itinerary_requests ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ;
+ALTER TABLE case_itinerary_requests ADD COLUMN IF NOT EXISTS last_reply_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE case_itinerary_requests ADD COLUMN IF NOT EXISTS destination_cities TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE case_itinerary_requests ADD COLUMN IF NOT EXISTS english_pdf BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE case_itinerary_requests ADD COLUMN IF NOT EXISTS departure_window TEXT NOT NULL DEFAULT '';
+ALTER TABLE case_itinerary_requests ADD COLUMN IF NOT EXISTS duration_approximate BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE INDEX IF NOT EXISTS idx_open_questions_case
     ON open_questions (tenant_id, case_id, status, created_at DESC);

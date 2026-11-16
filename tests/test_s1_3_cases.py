@@ -3,7 +3,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 import uuid
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -18,12 +20,13 @@ from visa_agent.case_service import (
     set_takeover,
 )
 from visa_agent.case_service.service import bump_case_version
-from visa_agent.config import Settings
+from visa_agent.config import Settings, get_settings
 from visa_agent.delivery import assemble_package
 from visa_agent.document_pipeline import attach_evidence, set_evidence_quarantine
-from visa_agent.domain.enums import CaseStatus, DeliveryKind, ErrorCode
+from visa_agent.domain.enums import CaseStatus, DeliveryKind, ErrorCode, RouteCode
 from visa_agent.domain.errors import DomainError
 from visa_agent.email_adapter.inbound import InboundEmail, persist_inbound
+from visa_agent.rules.service import ensure_seed_route_packs, record_requirement_applicability, record_requirement_review
 from visa_agent.send_control import PackageSendRequest, send_case_package
 from visa_agent.storage.files import LocalFileStore
 from visa_agent.storage.migrate import apply_migrations
@@ -97,33 +100,29 @@ def _walk_to_ready(case_id: str) -> None:
     )
 
 
-def _accept_evidence(case_id: str, store: LocalFileStore) -> str:
-    case = get_case(database_url=DB, tenant_id=TENANT, case_id=case_id)
-    ev = attach_evidence(
-        database_url=DB,
-        tenant_id=TENANT,
-        case_id=case_id,
-        file_store=store,
-        data=b"%PDF-s13-final",
-        original_filename="final.pdf",
-        classification="passport",
-        expected_case_version=case.case_version,
-    )
-    case = get_case(database_url=DB, tenant_id=TENANT, case_id=case_id)
-    set_evidence_quarantine(
-        database_url=DB,
-        tenant_id=TENANT,
-        case_id=case_id,
-        evidence_id=ev.id,
-        quarantine_status="accepted_for_review",
-        expected_case_version=case.case_version,
-    )
-    return ev.id
+def _accept_evidence(case_id: str, store: LocalFileStore) -> list[str]:
+    ensure_seed_route_packs(database_url=DB)
+    keys = dict(database_url=DB, tenant_id=TENANT, case_id=case_id)
+    ids = []
+    for label, requirement in (
+        ("passport", "passport_valid"), ("purpose", "visit_purpose_allowed"),
+        ("itinerary", "intention_to_leave"), ("bank", "funds_for_stay"), ("employment", "home_ties"),
+    ):
+        ev = attach_evidence(
+            **keys, file_store=store, data=f"%PDF-s13-{label}".encode(), original_filename=f"{label}.pdf",
+            classification=label, expected_case_version=_ver(case_id),
+        )
+        record_requirement_review(**keys, requirement_key=requirement, expected_case_version=_ver(case_id))
+        ids.append(ev.id)
+    for requirement in ("sponsor_if_any", "translation_if_needed", "transfer_human_triggers"):
+        record_requirement_applicability(**keys, requirement_key=requirement, decision="not_applicable",
+                                         note="synthetic test case", expected_case_version=_ver(case_id))
+    return ids
 
 
 def _send_final_package(
     case_id: str,
-    evidence_id: str,
+    evidence_ids: list[str],
     store: LocalFileStore,
     *,
     recipient: str = "allow@example.com",
@@ -139,7 +138,7 @@ def _send_final_package(
         case_id=case_id,
         package_kind=DeliveryKind.FINAL_PACKAGE.value,
         file_store=store,
-        evidence_ids=[evidence_id],
+        evidence_ids=evidence_ids,
         expected_case_version=case.case_version,
     )
     record_final_review(
@@ -314,7 +313,7 @@ class CaseWorkflowTests(unittest.TestCase):
         self.assertEqual(ctx2.exception.code, ErrorCode.REVIEW_APPROVAL_REQUIRED)
 
     def test_stale_delivery_id_cannot_confirm_new_round(self) -> None:
-        case = create_case(database_url=DB, tenant_id=TENANT, title="resend")
+        case = create_case(database_url=DB, tenant_id=TENANT, title="resend", route=RouteCode.STANDARD_VISITOR)
         store = LocalFileStore(Path(tempfile.mkdtemp()) / "files")
         eid = _accept_evidence(case.id, store)
         _walk_to_ready(case.id)
@@ -362,7 +361,7 @@ class CaseWorkflowTests(unittest.TestCase):
         )
 
     def test_sent_requires_final_package_and_delivered_needs_receipt(self) -> None:
-        case = create_case(database_url=DB, tenant_id=TENANT, title="deliver")
+        case = create_case(database_url=DB, tenant_id=TENANT, title="deliver", route=RouteCode.STANDARD_VISITOR)
         store = LocalFileStore(Path(tempfile.mkdtemp()) / "files")
         eid = _accept_evidence(case.id, store)
         _walk_to_ready(case.id)
@@ -572,11 +571,13 @@ class CaseWorkflowTests(unittest.TestCase):
 
 class CaseHttpTests(unittest.TestCase):
     def setUp(self) -> None:
-        apply_migrations(DB)
-        from visa_agent.fastapi_app import app, bootstrap
+        from visa_agent import fastapi_app
 
-        bootstrap()
-        self.client = TestClient(app)
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = replace(get_settings(root / ".env"), file_storage_dir=root)
+        self.enterContext(patch.object(fastapi_app, "get_settings", return_value=settings))
+        fastapi_app.bootstrap(settings)
+        self.client = TestClient(fastapi_app.app)
 
     def test_api_confirm_requires_version_field(self) -> None:
         created = self.client.post(
@@ -603,21 +604,120 @@ class CaseHttpTests(unittest.TestCase):
         )
         self.assertEqual(rejected.status_code, 409)
 
-    def test_workbench_pages_render(self) -> None:
-        created = self.client.post(
-            "/cases", json={"title": "wb-page", "customer_email": "x@y.com"}
+    def test_workbench_approval_and_email_events_move_delivery_forward(self) -> None:
+        from visa_agent.fastapi_app import get_settings as app_settings
+
+        recipient = f"receipt-{uuid.uuid4().hex}@example.com"
+        keys = dict(database_url=DB, tenant_id=TENANT)
+        case = create_case(**keys, customer_email=recipient, status=CaseStatus.FINAL_REVIEW,
+                           route=RouteCode.STANDARD_VISITOR)
+        path = f"/workbench/cases/{case.id}"
+        self.assertNotIn(f"{path}/reviews", self.client.get(path).text)
+        settings = replace(
+            app_settings(), email_smtp_host="smtp.example.com", email_smtp_user="agent@example.com",
+            email_smtp_password="test-only", email_from="agent@example.com", outbound_allowlist=frozenset({recipient}),
         )
+        store = LocalFileStore(settings.file_storage_dir)
+        evidence_id = _accept_evidence(case.id, store)
+        _confirm(case.id)
+        final_review = self.client.get(path).text
+        self.assertIn("终审通过", final_review)
+        self.assertIn("核对客户已确认的材料", final_review)
+        review = self.client.post(
+            f"{path}/reviews", data={"decision": "approve", "expected_case_version": _ver(case.id)},
+        )
+        self.assertIn("进度：<strong>交付中</strong>", review.text)
+        self.assertNotIn('id="advisor-work"', review.text)
+        self.assertEqual(get_case(**keys, case_id=case.id).status, CaseStatus.READY_TO_DELIVER)
+        package = assemble_package(
+            **keys, case_id=case.id, package_kind=DeliveryKind.FINAL_PACKAGE.value, file_store=store,
+            evidence_ids=evidence_id, expected_case_version=_ver(case.id),
+        )
+        request = PackageSendRequest(
+            package_id=package.package_id, recipients=(recipient,), subject="Materials", body_text="Attached.",
+        )
+        with patch("visa_agent.send_control.service.send_smtp", return_value="250 accepted") as smtp:
+            self.assertEqual(send_case_package(settings=settings, case_id=case.id, req=request).status, "blocked")
+            smtp.assert_not_called()
+            record_final_review(
+                **keys, case_id=case.id, decision="approve", expected_case_version=_ver(case.id),
+                package_id=package.package_id, recipients=[recipient], reviewer_id="test-reviewer",
+            )
+            self.assertEqual(send_case_package(settings=settings, case_id=case.id, req=request).status,
+                             "provider_accepted")
+            message_id = smtp.call_args.kwargs["message_id"]
+        self.assertEqual(get_case(**keys, case_id=case.id).status, CaseStatus.SENT_AWAITING_ACK)
+        self.assertIn("客户直接回复交付邮件「确认收件」", self.client.get(path).text)
+
+        def reply(body, parent):
+            response = self.client.post(
+                "/internal/email/inbound",
+                json={"from_addr": recipient, "to_addrs": ["agent@example.com"], "subject": "Re: Materials",
+                      "body_text": body, "rfc_message_id": f"<{uuid.uuid4().hex}@example.com>",
+                      "in_reply_to": parent},
+            )
+            self.assertEqual(response.status_code, 200)
+
+        reply("确认收件", None)
+        reply("谢谢", message_id)
+        self.assertEqual(get_case(**keys, case_id=case.id).status, CaseStatus.SENT_AWAITING_ACK)
+        reply("确认收件", message_id)
+        self.assertEqual(get_case(**keys, case_id=case.id).status, CaseStatus.DELIVERED)
+        self.assertIn("已办完", self.client.get(path).text)
+
+    def test_workbench_pages_render(self) -> None:
+        created = self.client.post("/cases", json={"title": "wb-page"})
         case_id = created.json()["data"]["case_id"]
         detail = self.client.get(f"/workbench/cases/{case_id}")
         self.assertEqual(detail.status_code, 200)
         self.assertIn('name="expected_case_version"', detail.text)
-        self.assertIn('name="expected_delivery_id"', detail.text)
-        self.assertIn('name="expected_closure_seq"', detail.text)
+        self.assertNotIn('name="expected_delivery_id"', detail.text)
+        self.assertNotIn('name="expected_closure_seq"', detail.text)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalFileStore(Path(tmp))
+            evidence_id = _accept_evidence(case_id, store)
+            _walk_to_ready(case_id)
+            ready = self.client.get(f"/workbench/cases/{case_id}")
+            self.assertIn("进度：<strong>交付中</strong>", ready.text)
+            self.assertNotIn('id="advisor-work"', ready.text)
+            self.assertNotIn(f"/workbench/cases/{case_id}/transition", ready.text)
+            _send_final_package(case_id, evidence_id, store)
+            sent = self.client.get(f"/workbench/cases/{case_id}")
+            self.assertNotIn("等待客户确认收件", sent.text)
+            apply_transition(
+                database_url=DB,
+                tenant_id=TENANT,
+                case_id=case_id,
+                target=CaseStatus.SENT_AWAITING_ACK,
+            )
+            detail = self.client.get(f"/workbench/cases/{case_id}")
+            self.assertEqual(detail.status_code, 200)
+            self.assertIn("等待客户确认收件", detail.text)
+            self.assertNotIn(f"/workbench/cases/{case_id}/receipt", detail.text)
+            self.assertNotIn('name="expected_closure_seq"', detail.text)
+
+        apply_transition(
+            database_url=DB,
+            tenant_id=TENANT,
+            case_id=case_id,
+            target=CaseStatus.CLOSED,
+        )
+        closed = self.client.get(f"/workbench/cases/{case_id}")
+        self.assertEqual(closed.status_code, 200)
+        self.assertIn("案件已结束", closed.text)
+        self.assertNotIn("<form", closed.text)
+        self.assertIn(f"/evidence/{evidence_id[0]}/file?download=1", closed.text)
+        for action in ("takeover", "transition", "bump-version", "evidence", "advisor-reply"):
+            with self.subTest(action=action):
+                stale = self.client.post(f"/workbench/cases/{case_id}/{action}")
+                self.assertEqual(stale.status_code, 409)
+                self.assertEqual(stale.json()["detail"], "案件已结束，仅可查看")
+        reopen = self.client.post(f"/workbench/cases/{case_id}/reopen-grant")
+        self.assertEqual(reopen.status_code, 404)
 
     def test_workbench_rejects_non_integer_version(self) -> None:
-        created = self.client.post(
-            "/cases", json={"title": "bad-ver", "customer_email": "x@y.com"}
-        )
+        created = self.client.post("/cases", json={"title": "bad-ver"})
         case_id = created.json()["data"]["case_id"]
         resp = self.client.post(
             f"/workbench/cases/{case_id}/confirm",

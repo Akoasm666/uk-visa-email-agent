@@ -1,4 +1,4 @@
-"""New case customer email is auto-added to outbound allowlist."""
+"""The send gate requires an explicit allowlist entry."""
 
 from __future__ import annotations
 
@@ -8,28 +8,28 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from visa_agent.case_service.outreach import send_opening_outreach
 from visa_agent.case_service.service import create_case
 from visa_agent.config import Settings
 from visa_agent.domain.enums import RouteCode
 from visa_agent.email_adapter.allowlist import (
+    add_outbound_allowlist_email,
     effective_outbound_allowlist,
     list_db_allowlist,
 )
-from visa_agent.email_adapter.outbox import OutboxResult
+from visa_agent.email_adapter.outbox import OutboxRequest, enqueue_and_maybe_send
 from visa_agent.storage.migrate import apply_migrations
 
 DB = "postgresql://visa_agent:visa_agent_dev@127.0.0.1:15432/visa_agent"
 TENANT = "demo"
 
 
-def _settings(*, allowlist: frozenset[str] = frozenset()) -> Settings:
+def _settings(*, allowlist: frozenset[str] = frozenset(), tenant_id: str = TENANT) -> Settings:
     return Settings(
         app_host="127.0.0.1",
         app_port=8000,
         database_url=DB,
         file_storage_dir=Path(tempfile.mkdtemp()),
-        tenant_id=TENANT,
+        tenant_id=tenant_id,
         siliconflow_api_key="",
         siliconflow_base_url="https://api.siliconflow.cn/v1",
         siliconflow_model="zai-org/GLM-5.3-Flash",
@@ -51,7 +51,7 @@ class CaseCreateAllowlistTests(unittest.TestCase):
     def setUp(self) -> None:
         apply_migrations(DB)
 
-    def test_create_case_adds_customer_email_to_db_allowlist(self) -> None:
+    def test_case_creation_and_legacy_case_entries_do_not_authorize_send(self) -> None:
         email = f"new-client-{uuid.uuid4().hex[:8]}@example.com"
         # .env / settings allowlist intentionally empty.
         settings = _settings(allowlist=frozenset())
@@ -60,46 +60,31 @@ class CaseCreateAllowlistTests(unittest.TestCase):
         case = create_case(
             database_url=DB,
             tenant_id=TENANT,
-            title="白名单自动加入",
+            title="白名单验收",
             customer_email=email,
             route=RouteCode.STANDARD_VISITOR,
         )
-        db = list_db_allowlist(database_url=DB, tenant_id=TENANT)
-        self.assertIn(email, db)
-        effective = effective_outbound_allowlist(settings)
-        self.assertIn(email, effective)
-
-        fake = OutboxResult(
-            outbox_id="ob1",
-            status="provider_accepted",
-            block_reasons=(),
-            provider_response="250 ok",
-            email_event_id="ee1",
-            send_operation_id=f"case-opening:{TENANT}:{case.id}",
+        self.assertNotIn(email, list_db_allowlist(database_url=DB, tenant_id=TENANT))
+        add_outbound_allowlist_email(
+            database_url=DB, tenant_id=TENANT, email=email,
+            case_id=case.id, source="case_create",
         )
-        with patch(
-            "visa_agent.case_service.outreach.enqueue_and_maybe_send",
-            return_value=fake,
-        ) as send:
-            result = send_opening_outreach(settings=settings, case=case)
-        self.assertTrue(result.sent)
-        # Gate uses effective allowlist inside enqueue; here we only assert outreach runs.
-        self.assertTrue(send.called)
+        self.assertNotIn(email, effective_outbound_allowlist(settings))
+        with patch("visa_agent.email_adapter.outbox.send_smtp") as send:
+            result = enqueue_and_maybe_send(
+                settings=settings,
+                req=OutboxRequest(kind="ordinary_reply", recipients=(email,),
+                                  subject="test", body_text="test"),
+            )
+        self.assertIn("OUTBOUND_NOT_ALLOWLISTED", result.block_reasons)
+        send.assert_not_called()
 
     def test_outbox_accepts_db_allowlisted_recipient(self) -> None:
-        from visa_agent.email_adapter.outbox import OutboxRequest, enqueue_and_maybe_send
-
         email = f"db-allow-{uuid.uuid4().hex[:8]}@example.com"
-        settings = _settings(allowlist=frozenset())
-        create_case(
-            database_url=DB,
-            tenant_id=TENANT,
-            title="outbox-db-allow",
-            customer_email=email,
-            route=RouteCode.STANDARD_VISITOR,
-        )
+        settings = _settings(allowlist=frozenset(), tenant_id=f"allow-{uuid.uuid4().hex}")
+        add_outbound_allowlist_email(database_url=DB, tenant_id=settings.tenant_id, email=email)
 
-        def _fake_send(settings, recipients, subject, body_text):  # noqa: ANN001
+        def _fake_send(settings, **kwargs):  # noqa: ANN001
             return "250 mock"
 
         with patch(

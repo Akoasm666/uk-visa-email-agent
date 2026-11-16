@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import email
 import imaplib
-import ssl
+from collections import defaultdict
 from dataclasses import dataclass
 from email.header import decode_header, make_header
 from email.message import Message
 from typing import Protocol
 
+import psycopg
+
 from visa_agent.config import Settings
-from visa_agent.domain.enums import ErrorCode
+from visa_agent.domain.enums import CaseStatus, ErrorCode
 from visa_agent.domain.errors import DomainError
+from visa_agent.email_adapter.allowlist import normalize_email
 from visa_agent.email_adapter.inbound import (
     InboundAttachment,
     InboundEmail,
     persist_inbound,
 )
+from visa_agent.email_adapter.proxy import SocksIMAP4SSL
+from visa_agent.email_adapter.threading import message_ids
+from visa_agent.email_adapter.tls import mail_tls_context
 from visa_agent.storage.files import LocalFileStore
 
 
@@ -174,6 +180,58 @@ def _extract_fetch_body(
     return None
 
 
+def _unseen_uids(client: ImapUidClient, *criteria: str) -> list[bytes]:
+    typ, data = client.uid("SEARCH", None, "UNSEEN", *criteria)
+    if typ != "OK":
+        raise DomainError(code=ErrorCode.SYSTEM_BLOCKED, message="IMAP search failed")
+    return data[0].split() if data and isinstance(data[0], bytes) else []
+
+
+def _case_thread_uids(
+    client: ImapUidClient, settings: Settings, limit: int,
+) -> list[bytes]:
+    """Personal inbox mode: fetch full MIME only after verifying sender and thread."""
+    with psycopg.connect(settings.database_url) as conn:
+        rows = conn.execute(
+            """
+            SELECT lower(trim(c.customer_email)), o.rfc_message_id
+            FROM outbox_messages o
+            JOIN cases c ON c.tenant_id = o.tenant_id AND c.id = o.case_id
+            WHERE c.tenant_id = %s AND c.status NOT IN (%s, %s)
+              AND lower(trim(c.customer_email)) = ANY(%s)
+              AND o.status = 'provider_accepted' AND o.rfc_message_id IS NOT NULL
+            """,
+            (settings.tenant_id, CaseStatus.CLOSED.value, CaseStatus.DELIVERED.value,
+             sorted(settings.outbound_allowlist)),
+        ).fetchall()
+    anchors: dict[str, set[str]] = defaultdict(set)
+    for sender, message_id in rows:
+        if normalize_email(sender) == sender and sender.isascii():
+            anchors[sender].add(message_id)
+
+    candidates: set[bytes] = set()
+    for sender in anchors:
+        quoted = '"' + sender.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        candidates.update(_unseen_uids(client, "FROM", quoted))
+
+    matched: list[bytes] = []
+    for uid in sorted(candidates, key=int):
+        typ, data = client.uid(
+            "FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (FROM IN-REPLY-TO REFERENCES)])",
+        )
+        headers = _extract_fetch_body(data) if typ == "OK" else None
+        if headers is None:
+            raise DomainError(code=ErrorCode.SYSTEM_BLOCKED, message="IMAP header fetch failed")
+        message = email.message_from_bytes(headers)
+        sender = normalize_email(_decode_header(message.get("From")))
+        references = message_ids(message.get("In-Reply-To")) + message_ids(message.get("References"))
+        if sender and anchors.get(sender, set()).intersection(references):
+            matched.append(uid)
+            if len(matched) == limit:
+                break
+    return matched
+
+
 def _process_unseen(
     *,
     client: ImapUidClient,
@@ -184,23 +242,11 @@ def _process_unseen(
     uidvalidity: str,
 ) -> PollResult:
     """UID SEARCH UNSEEN + BODY.PEEK; mark \\Seen only after successful persist."""
-    typ, data = client.uid("SEARCH", None, "UNSEEN")
-    if typ != "OK" or not data or not data[0]:
-        return PollResult(
-            messages=(),
-            failures=(),
-            mailbox=mailbox,
-            uidvalidity=uidvalidity,
-        )
-    raw_ids = data[0]
-    if not isinstance(raw_ids, (bytes, bytearray)):
-        return PollResult(
-            messages=(),
-            failures=(),
-            mailbox=mailbox,
-            uidvalidity=uidvalidity,
-        )
-    uids = raw_ids.split()[-limit:]
+    uids = (
+        _case_thread_uids(client, settings, limit)
+        if settings.email_imap_case_threads_only
+        else _unseen_uids(client)[:limit]
+    )
     messages: list[PolledInbound] = []
     failures: list[PollFailure] = []
 
@@ -266,33 +312,16 @@ def _process_unseen(
                     rfc_message_id=rfc_id,
                     provider_message_id=dedupe_provider_id,
                     attachments=_extract_attachments(msg),
+                    in_reply_to=" ".join(map(str, msg.get_all("In-Reply-To", ()))) or None,
+                    references=" ".join(map(str, msg.get_all("References", ()))) or None,
                 ),
                 file_store=file_store,
             )
-            attributed_case_id: str | None = None
-            if (
-                persisted.attribution_status == "unattributed"
-                and not persisted.duplicate
-            ):
-                from visa_agent.case_service.outreach import (
-                    try_auto_attribute_inbound_by_customer_email,
-                )
+            from visa_agent.case_service.inbound_agent import process_persisted_inbound
 
-                attributed_case_id = try_auto_attribute_inbound_by_customer_email(
-                    settings=settings,
-                    email_event_id=persisted.email_event_id,
-                    from_addr=from_addr,
-                )
-            if attributed_case_id and not persisted.duplicate:
-                from visa_agent.case_service.inbound_agent import (
-                    process_inbound_after_attribution,
-                )
-
-                process_inbound_after_attribution(
-                    settings=settings,
-                    case_id=attributed_case_id,
-                    email_event_id=persisted.email_event_id,
-                )
+            process_persisted_inbound(
+                settings=settings, email_event_id=persisted.email_event_id,
+            )
         except Exception as exc:  # noqa: BLE001
             # Leave UNSEEN so the next poll can retry this message.
             failures.append(
@@ -370,17 +399,12 @@ def poll_imap_inbox(
         )
 
     try:
-        import certifi
-
-        context = ssl.create_default_context(cafile=certifi.where())
-    except Exception:  # noqa: BLE001
-        context = ssl.create_default_context()
-
-    try:
-        imap = imaplib.IMAP4_SSL(
-            settings.email_imap_host,
-            settings.email_imap_port,
-            ssl_context=context,
+        endpoint = (settings.email_imap_host, settings.email_imap_port)
+        context = mail_tls_context()
+        imap = (
+            SocksIMAP4SSL(*endpoint, proxy_url=settings.email_proxy_url, ssl_context=context, timeout=30)
+            if settings.email_proxy_url
+            else imaplib.IMAP4_SSL(*endpoint, ssl_context=context, timeout=30)
         )
         try:
             imap.login(settings.email_imap_user, settings.email_imap_password)

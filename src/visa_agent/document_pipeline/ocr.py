@@ -1,18 +1,24 @@
 """OCR providers — extract derived text without mutating original evidence bytes.
 
-Default provider is a local synthetic extractor suitable for tests and demos.
-Plug a real engine by implementing ``OcrProvider`` and passing it to
-``run_ocr_on_evidence`` (or set ``VISA_AGENT_OCR_PROVIDER`` when wiring the app).
-
 OCR results are derived artifacts only — they never rewrite quarantine originals
 and never auto-confirm field annotations (TL: human confirms fields).
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
 from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
 from typing import Protocol
+from xml.etree import ElementTree
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +59,9 @@ _TEXTUAL_TYPES = frozenset(
 _TEXTUAL_EXT = frozenset(
     {".txt", ".csv", ".json", ".xml", ".html", ".htm", ".md", ".log"}
 )
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+_WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_DOCX_TEXT_PART = re.compile(r"word/(?:document|header\d+|footer\d+|footnotes|endnotes)\.xml")
 # Embedded printable runs inside synthetic PDF/image demo bytes.
 _PRINTABLE_RUN = re.compile(rb"[\x20-\x7E\n\r\t]{4,}")
 
@@ -141,5 +150,110 @@ class SyntheticOcrProvider:
         )
 
 
+class LocalScanOcrProvider:
+    """Read pixels through the local Vision helper, with no network calls."""
+
+    name = "vision_local_v1"
+    executable = "visa-agent-vision-ocr"
+
+    def _extract_docx(self, data: bytes) -> OcrExtraction:
+        lines = []
+        try:
+            with zipfile.ZipFile(BytesIO(data)) as archive:
+                entries = archive.infolist()
+                if (
+                    len(entries) > 512 or sum(entry.file_size for entry in entries) > 48 * 1024 * 1024
+                    or "word/document.xml" not in archive.namelist()
+                    or any(
+                        entry.filename.lower().startswith(("word/activex/", "word/embeddings/"))
+                        or "vbaproject" in entry.filename.lower()
+                        for entry in entries
+                    )
+                ):
+                    return OcrExtraction("", "unsupported", self.name, "docx_content_not_supported")
+                text_parts = sorted(entry.filename for entry in entries if _DOCX_TEXT_PART.fullmatch(entry.filename))
+                for part in text_parts:
+                    xml = ElementTree.fromstring(archive.read(part))
+                    for paragraph in xml.iter(_WORD_NS + "p"):
+                        line = "".join(run.text or "" for run in paragraph.iter(_WORD_NS + "t")).strip()
+                        if line:
+                            lines.append(line)
+                images = [entry for entry in entries
+                          if entry.filename.startswith("word/media/") and not entry.is_dir()]
+                if len(images) > 12:
+                    return OcrExtraction("", "unsupported", self.name, "docx_image_limit")
+                for image in images:
+                    result = self.extract(archive.read(image), filename=image.filename, content_type="")
+                    if result.status != "completed":
+                        return OcrExtraction("", result.status, self.name, "docx_embedded_image_unreadable")
+                    if result.text.strip():
+                        lines.append(result.text)
+        except (ElementTree.ParseError, zipfile.BadZipFile, RuntimeError, OSError):
+            return OcrExtraction("", "failed", self.name, "docx_text_extract_failed")
+        return OcrExtraction("\n".join(lines), "completed", self.name, "docx_text_and_images")
+
+    def extract(
+        self,
+        data: bytes,
+        *,
+        filename: str,
+        content_type: str,
+    ) -> OcrExtraction:
+        if data.startswith(b"%PDF-"):
+            format_name = "pdf"
+        elif data.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")):
+            format_name = "raster"
+        elif data.startswith(b"PK\x03\x04") and (_ext(filename) == ".docx" or content_type == _DOCX_MIME):
+            return self._extract_docx(data)
+        elif content_type.split(";", 1)[0].strip().lower() in _TEXTUAL_TYPES:
+            try:
+                text = data.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                return OcrExtraction("", "failed", self.name, "invalid_utf8")
+            return OcrExtraction(text, "completed", self.name, "utf8_text_decode")
+        else:
+            return OcrExtraction("", "unsupported", self.name, "unsupported_scan_format")
+        executable = os.environ.get("VISA_AGENT_VISION_OCR")
+        local_helper = Path(sys.executable).parent / self.executable
+        if not executable:
+            executable = str(local_helper) if local_helper.is_file() else shutil.which(self.executable)
+        if not executable:
+            return OcrExtraction("", "failed", self.name, "ocr_helper_missing")
+        try:
+            with tempfile.TemporaryDirectory(prefix="visa-scan-") as directory:
+                scan = Path(directory) / "input"
+                scan.write_bytes(data)
+                result = subprocess.run(
+                    [executable, format_name, str(scan)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                    check=False,
+                )
+        except subprocess.TimeoutExpired:
+            return OcrExtraction("", "failed", self.name, "ocr_timeout")
+        except OSError:
+            return OcrExtraction("", "failed", self.name, "ocr_helper_unavailable")
+        if result.returncode:
+            reason = {2: "encrypted_pdf", 3: "scan_processing_limit"}.get(
+                result.returncode, "scan_decode_or_ocr_failed"
+            )
+            return OcrExtraction("", "failed", self.name, reason)
+        try:
+            pages = json.loads(result.stdout)
+            if not isinstance(pages, list) or not 1 <= len(pages) <= 12:
+                raise ValueError("invalid page count")
+            texts = [page["text"] for page in pages]
+            metadata = {
+                "pages": [
+                    {"sharpness": page.get("sharpness"), "touches_edge": page["touchesEdge"]}
+                    for page in pages
+                ]
+            }
+            return OcrExtraction("\f".join(texts), "completed", self.name, json.dumps(metadata))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return OcrExtraction("", "failed", self.name, "ocr_invalid_result")
+
+
 def default_ocr_provider() -> OcrProvider:
-    return SyntheticOcrProvider()
+    return LocalScanOcrProvider()

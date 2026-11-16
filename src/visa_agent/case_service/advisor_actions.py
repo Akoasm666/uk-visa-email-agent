@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
+
+import psycopg
 
 from visa_agent.ai_capabilities.language import detect_reply_language
 from visa_agent.case_service.remediation import (
@@ -13,7 +18,9 @@ from visa_agent.case_service.remediation import (
     close_remediation,
     list_open_questions,
 )
-from visa_agent.case_service.service import CaseRecord, get_case
+from visa_agent.case_service.service import (
+    FINISHED_CASE_STATUSES, CaseRecord, _require_version, bump_case_version_in_conn, get_case,
+)
 from visa_agent.config import Settings
 from visa_agent.domain.enums import ErrorCode, OutboundMessageKind
 from visa_agent.domain.errors import DomainError
@@ -23,7 +30,11 @@ from visa_agent.document_pipeline.service import (
     list_evidence,
     set_evidence_classification,
 )
-from visa_agent.email_adapter.outbox import OutboxRequest, OutboxResult, enqueue_and_maybe_send
+from visa_agent.email_adapter.allowlist import normalize_email
+from visa_agent.email_adapter.outbox import (
+    TAKEOVER_REPLY_OPERATION_PREFIX, OutboxRequest, OutboxResult, enqueue_and_maybe_send,
+)
+from visa_agent.email_adapter.threading import new_reply_body, reply_references, single_message_id
 from visa_agent.rules import evaluate_case_requirements
 
 # classification value → Chinese label for workbench select
@@ -64,6 +75,116 @@ class AdvisorReplyResult:
     outbox: OutboxResult
     closed_question: bool
     language: str
+
+
+@dataclass(frozen=True, slots=True)
+class CustomerMail:
+    id: str
+    direction: str
+    subject: str
+    body: str
+    message_id: str | None
+    in_reply_to: str | None
+    references: str | None
+    created_at: datetime
+
+
+def list_customer_mail(
+    settings: Settings, case: CaseRecord, *, event_id: str | None = None,
+) -> list[CustomerMail]:
+    email = normalize_email(case.customer_email)
+    if not email:
+        return []
+    with psycopg.connect(settings.database_url) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, direction, subject, body_text, rfc_message_id, in_reply_to, email_references, created_at
+            FROM email_events
+            WHERE tenant_id = %s AND case_id = %s AND attribution_status = 'attributed'
+              AND (%s::text IS NULL OR id = %s)
+              AND ((direction = 'inbound' AND lower(trim(from_addr)) = %s)
+                OR (direction = 'outbound' AND to_addrs @> %s::jsonb))
+            ORDER BY created_at DESC, id DESC
+            """,
+            (settings.tenant_id, case.id, event_id, event_id, email, json.dumps([email])),
+        ).fetchall()
+    return [
+        CustomerMail(id, direction, subject, new_reply_body(body) if direction == "inbound" else body,
+                     message_id, in_reply_to, references, created_at)
+        for id, direction, subject, body, message_id, in_reply_to, references, created_at in rows
+    ]
+
+
+def takeover_reply_subject(mail: CustomerMail | None) -> str:
+    subject = " ".join(mail.subject.split()) if mail else ""
+    if not subject:
+        return "签证案件沟通"
+    return subject if subject.lower().startswith("re:") else f"Re: {subject}"
+
+
+def fill_takeover_customer_email(
+    *, settings: Settings, case_id: str, customer_email: str, expected_case_version: int | None,
+) -> None:
+    email = normalize_email(customer_email)
+    if not email:
+        raise DomainError(ErrorCode.VALIDATION_ERROR, "请输入有效的客户邮箱")
+    keys = dict(database_url=settings.database_url, tenant_id=settings.tenant_id, case_id=case_id)
+    with psycopg.connect(settings.database_url) as conn:
+        case = get_case(**keys, conn=conn, for_update=True)
+        if case.status in FINISHED_CASE_STATUSES or not case.human_takeover:
+            raise DomainError(ErrorCode.VALIDATION_ERROR, "请在办理中的案件接管后填写客户邮箱")
+        existing = normalize_email(case.customer_email)
+        if existing == email:
+            return
+        _require_version(case, expected_case_version, required=True)
+        if existing:
+            raise DomainError(ErrorCode.VALIDATION_ERROR, "案件已有客户邮箱")
+        conn.execute(
+            """UPDATE cases SET customer_email = %s WHERE tenant_id = %s AND id = %s""",
+            (email, case.tenant_id, case.id),
+        )
+        bump_case_version_in_conn(**keys, conn=conn, expected_case_version=case.case_version)
+
+
+def send_takeover_reply(
+    *, settings: Settings, case_id: str, body: str, request_id: str,
+    reply_event_id: str, expected_case_version: int | None,
+) -> OutboxResult:
+    if not body.strip():
+        raise DomainError(ErrorCode.VALIDATION_ERROR, "请输入邮件正文")
+    if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        raise DomainError(ErrorCode.VALIDATION_ERROR, "回复表单已失效，请重新提交")
+    case = get_case(database_url=settings.database_url, tenant_id=settings.tenant_id, case_id=case_id)
+    _require_version(case, expected_case_version, required=True)
+    if case.status in FINISHED_CASE_STATUSES or not case.human_takeover:
+        raise DomainError(ErrorCode.VALIDATION_ERROR, "请在办理中的案件接管后发送顾问回复")
+    email = normalize_email(case.customer_email)
+    if not email:
+        raise DomainError(ErrorCode.VALIDATION_ERROR, "案件缺少客户邮箱")
+    mail = None
+    if reply_event_id:
+        matches = list_customer_mail(settings, case, event_id=reply_event_id)
+        if not matches:
+            raise DomainError(ErrorCode.VALIDATION_ERROR, "原邮件已变更，请按当前往来邮件重新核对")
+        mail = matches[0]
+    parent = single_message_id(mail.message_id) if mail else None
+    return enqueue_and_maybe_send(
+        settings=settings,
+        req=OutboxRequest(
+            kind=OutboundMessageKind.ORDINARY_REPLY,
+            recipients=(email,),
+            subject=takeover_reply_subject(mail),
+            body_text=body,
+            send_operation_id=f"{TAKEOVER_REPLY_OPERATION_PREFIX}{settings.tenant_id}:{case_id}:{request_id}",
+            case_id=case_id,
+            case_version=case.case_version,
+            in_reply_to=parent,
+            references=reply_references(
+                parent_id=parent, references=mail.references, parent_in_reply_to=mail.in_reply_to,
+            ) if parent and mail else (),
+            advisor_authored=True,
+        ),
+    )
 
 
 def _is_unclassified_label(label: str | None) -> bool:
@@ -218,6 +339,8 @@ def advisor_reply_via_agent(
             case_version=case.case_version,
         ),
     )
+    if out.status != "provider_accepted" or out.block_reasons:
+        return AdvisorReplyResult(outbox=out, closed_question=False, language=lang)
     closed = False
     targets: list[str] = []
     if question_id:

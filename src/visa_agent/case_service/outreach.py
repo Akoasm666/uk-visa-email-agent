@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import psycopg
+
 from visa_agent.case_service.service import CaseRecord, attribute_inbound_to_case, get_case
 from visa_agent.config import Settings
 from visa_agent.domain.enums import CaseStatus, ErrorCode, OutboundMessageKind, RouteCode
 from visa_agent.domain.errors import DomainError
+from visa_agent.email_adapter.allowlist import normalize_email
 from visa_agent.email_adapter.outbox import OutboxResult, OutboxRequest, enqueue_and_maybe_send
+from visa_agent.email_adapter.threading import message_ids
 from visa_agent.rules.seed import (
     GRADUATE_REQUIREMENTS,
     SKILLED_WORKER_REQUIREMENTS,
@@ -41,8 +45,8 @@ _MATERIAL_LINES: dict[str, tuple[str, str]] = {
         "Brief visit purpose (tourism / family / business, a short paragraph is fine)",
     ),
     "intention_to_leave": (
-        "行程或离境安排说明（机票意向、停留天数、回国计划）",
-        "Travel / departure plans (intended stay, return plans; tickets if you have them)",
+        "行程或离境安排说明（停留天数、离境计划）",
+        "Travel plans (intended stay and departure plans)",
     ),
     "funds_for_stay": (
         "资金证明（近几个月银行流水或存款证明；勿发密码）",
@@ -113,6 +117,42 @@ _SEED_BY_ROUTE = {
     RouteCode.GRADUATE.value: GRADUATE_REQUIREMENTS,
 }
 
+_OPENING_NEXT = {
+    CaseStatus.LEAD: CaseStatus.INTAKE_AUTHORIZATION,
+    CaseStatus.INTAKE_AUTHORIZATION: CaseStatus.ROUTE_SCOPE_CONFIRMED,
+    CaseStatus.ROUTE_SCOPE_CONFIRMED: CaseStatus.COLLECT_AND_VERIFY,
+}
+
+
+def advance_opening(
+    settings: Settings, case: CaseRecord, conn: psycopg.Connection, *, opening_sent: bool = False,
+) -> CaseRecord:
+    """Bring an opened case to collection using its successfully sent correspondence."""
+    customer = normalize_email(case.customer_email)
+    if case.status not in _OPENING_NEXT or not case.route or not customer or (
+        case.human_takeover or case.paused or case.cancelled or case.system_blocked
+        or case.waiting_third_party
+    ):
+        return case
+    if not opening_sent and not conn.execute(
+        """
+        SELECT 1 FROM outbox_messages WHERE tenant_id = %s AND case_id = %s
+          AND status = 'provider_accepted' AND recipients = jsonb_build_array(%s::text)
+          AND (send_operation_id = %s OR starts_with(send_operation_id, 'inbound-reply:'))
+        LIMIT 1
+        """,
+        (case.tenant_id, case.id, customer, f"case-opening:{case.tenant_id}:{case.id}"),
+    ).fetchone():
+        return case
+    from visa_agent.workflow.transitions import apply_transition
+
+    while case.status in _OPENING_NEXT:
+        case = apply_transition(
+            database_url=settings.database_url, tenant_id=case.tenant_id, case_id=case.id,
+            target=_OPENING_NEXT[case.status], expected_case_version=case.case_version, conn=conn,
+        )
+    return case
+
 
 @dataclass(frozen=True, slots=True)
 class OpeningOutreachResult:
@@ -140,6 +180,8 @@ def _material_checklist(case: CaseRecord) -> tuple[list[str], list[str]]:
     for req in seeds:
         if req.severity == "transfer_human" or req.key not in _MATERIAL_LINES:
             continue
+        if route == RouteCode.STANDARD_VISITOR.value and req.key in {"translation_if_needed", "intention_to_leave"}:
+            continue
         zh, en = _MATERIAL_LINES[req.key]
         zh_lines.append(f"  {len(zh_lines) + 1}. {zh}")
         en_lines.append(f"  {len(en_lines) + 1}. {en}")
@@ -152,6 +194,9 @@ def build_opening_email(case: CaseRecord) -> tuple[str, str]:
     visa_zh, visa_en = _route_labels(case)
     ref = case.id[:8]
     zh_items, en_items = _material_checklist(case)
+    if case.route == RouteCode.STANDARD_VISITOR:
+        zh_items.append("  如已确定旅行日期、停留天数和想去的英国城市，直接写在回复里，我会准备英文行程单。")
+        en_items.append("  Share your travel date, trip length and UK destinations, if known, so I can prepare your itinerary.")
     zh_list = "\n".join(zh_items) if zh_items else "  （清单稍后由顾问补充）"
     en_list = "\n".join(en_items) if en_items else "  (checklist to follow from your advisor)"
 
@@ -230,15 +275,20 @@ def send_opening_outreach(
             case_version=case.case_version,
         ),
     )
-    sent = result.status in {"provider_accepted", "pending", "status_unknown"} and not (
-        result.block_reasons
-    )
+    sent = result.status == "provider_accepted" and not result.block_reasons
     if sent:
-        _mark_waiting_customer(
-            database_url=settings.database_url,
-            tenant_id=settings.tenant_id,
-            case_id=case.id,
-        )
+        with psycopg.connect(settings.database_url) as conn:
+            live = get_case(database_url=settings.database_url, tenant_id=settings.tenant_id,
+                            case_id=case.id, conn=conn, for_update=True)
+            if live.case_version == case.case_version:
+                advance_opening(settings, live, conn, opening_sent=True)
+                conn.execute(
+                    """
+                    UPDATE cases SET waiting_customer = TRUE, updated_at = NOW()
+                    WHERE tenant_id = %s AND id = %s AND status = 'collect_and_verify'
+                    """,
+                    (settings.tenant_id, case.id),
+                )
         return OpeningOutreachResult(
             attempted=True, sent=True, skipped_reason=None, outbox=result
         )
@@ -252,72 +302,88 @@ def send_opening_outreach(
     )
 
 
-def _mark_waiting_customer(
-    *, database_url: str, tenant_id: str, case_id: str
-) -> None:
-    import psycopg
-
-    with psycopg.connect(database_url) as conn:
-        conn.execute(
-            """
-            UPDATE cases
-            SET waiting_customer = TRUE, updated_at = NOW()
-            WHERE tenant_id = %s AND id = %s
-            """,
-            (tenant_id, case_id),
-        )
-        conn.commit()
-
-
 def try_auto_attribute_inbound_by_customer_email(
     *,
     settings: Settings,
     email_event_id: str,
     from_addr: str,
 ) -> str | None:
-    """If exactly one open case matches the sender email, bind the inbound.
-
-    Returns attributed case_id, or None when ambiguous / unmatched.
-    """
+    """Use authorized thread anchors, or a unique sender match for new mail."""
     import psycopg
-
-    sender = (from_addr or "").strip().lower()
-    if not sender or "@" not in sender:
-        return None
-    # Strip display-name wrappers: "Name <a@b.com>"
-    if "<" in sender and ">" in sender:
-        sender = sender[sender.rfind("<") + 1 : sender.rfind(">")].strip()
 
     closed = {CaseStatus.CLOSED.value, CaseStatus.DELIVERED.value}
     with psycopg.connect(settings.database_url) as conn:
-        rows = conn.execute(
+        inbound = conn.execute(
             """
-            SELECT id FROM cases
-            WHERE tenant_id = %s
-              AND lower(trim(customer_email)) = %s
-              AND status <> ALL(%s)
-            ORDER BY updated_at DESC
-            LIMIT 3
+            SELECT from_addr, in_reply_to, email_references
+            FROM email_events
+            WHERE tenant_id = %s AND id = %s AND direction = 'inbound'
             """,
-            (settings.tenant_id, sender, list(closed)),
-        ).fetchall()
+            (settings.tenant_id, email_event_id),
+        ).fetchone()
+        if inbound is None:
+            return None
+        stored_sender, in_reply_to, references = inbound
+        sender = normalize_email(stored_sender)
+        if not sender or sender != normalize_email(from_addr):
+            return None
 
-    if len(rows) != 1:
-        return None
-    case_id = rows[0][0]
+        if in_reply_to or references:
+            thread_ids = [*message_ids(in_reply_to), *message_ids(references)]
+            rows = conn.execute(
+                """
+                SELECT c.id, c.customer_email, c.status
+                FROM cases c
+                JOIN (
+                    SELECT case_id FROM email_events
+                    WHERE tenant_id = %s AND rfc_message_id = ANY(%s) AND id <> %s
+                    UNION
+                    SELECT case_id FROM outbox_messages
+                    WHERE tenant_id = %s AND rfc_message_id = ANY(%s)
+                      AND status IN (
+                          'processing', 'provider_accepted', 'status_unknown', 'partial_accepted'
+                      )
+                ) AS anchors ON anchors.case_id = c.id
+                WHERE c.tenant_id = %s
+                """,
+                (
+                    settings.tenant_id, thread_ids, email_event_id,
+                    settings.tenant_id, thread_ids, settings.tenant_id,
+                ),
+            ).fetchall()
+            if len(rows) != 1:
+                return None
+            case_id, customer_email, status = rows[0]
+            if status in closed or normalize_email(customer_email) != sender:
+                return None
+            reason = "auto_match_email_thread"
+        else:
+            rows = conn.execute(
+                """
+                SELECT id FROM cases
+                WHERE tenant_id = %s
+                  AND lower(trim(customer_email)) = %s
+                  AND status <> ALL(%s)
+                LIMIT 2
+                """,
+                (settings.tenant_id, sender, list(closed)),
+            ).fetchall()
+            if len(rows) != 1:
+                return None
+            case_id = rows[0][0]
+            reason = "auto_match_customer_email"
     try:
         attribute_inbound_to_case(
             database_url=settings.database_url,
             tenant_id=settings.tenant_id,
             email_event_id=email_event_id,
             case_id=case_id,
-            reason="auto_match_customer_email",
+            reason=reason,
         )
     except DomainError as exc:
         if exc.code == ErrorCode.NOT_FOUND:
             return None
-        # Already attributed elsewhere / conflict — leave for human.
-        return None
+        raise
     return case_id
 
 
