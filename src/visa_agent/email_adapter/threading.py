@@ -37,14 +37,13 @@ def reply_references(
 
 
 _QUOTED_REPLY = re.compile(
-    r"^[ \t]*(?:-+[ \t]*(?:original message|forwarded message|原始邮件|转发邮件)[ \t]*-+"
+    r"^[ \t]*(?:>[ \t]*)*(?:-+[ \t]*(?:original message|forwarded message|原始邮件|转发邮件)[ \t]*-+"
     r"|begin forwarded message[:：]"
     r"|on[ \t]+[^\n]+(?:\n[^\n]*@[^\n]+)?[ \t]+wrote[:：]"
     r"|(?:在|于)[^\n]+(?:写道|的来信)[:：]"
     r"|_{5,}[ \t]*\n[ \t]*(?:from|发件人)[:：])[ \t]*",
     re.I | re.M,
 )
-
 def new_reply_body(body: str) -> str:
     text = body.replace("\r\n", "\n")
     separator = _QUOTED_REPLY.search(text)

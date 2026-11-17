@@ -23,12 +23,13 @@ from visa_agent.ai_capabilities.visitor_trip import extract_visitor_trip
 from visa_agent.case_service.delivery_events import acknowledge_delivery_from_reply
 from visa_agent.case_service.itinerary import get_case_itinerary, prepare_itinerary_reply, record_itinerary_sent
 from visa_agent.case_service.visitor_purpose import (
-    PURPOSE_LABELS, get_stated_visitor_purpose, record_visitor_purpose, stated_visit_purpose,
+    PURPOSE_LABELS, get_stated_visitor_purpose, record_visitor_purpose,
 )
 from visa_agent.case_service.material_confirmation import (
     advance_material_confirmation,
+    classify_material_confirmation_reply,
     confirm_materials_from_reply,
-    is_current_material_confirmation_reply,
+    material_confirmation_reply_version,
 )
 from visa_agent.case_service.outreach import (
     _MATERIAL_LINES,
@@ -100,11 +101,6 @@ _QUESTION_HINTS = re.compile(
 _MATERIAL_STATUS_REQUEST = re.compile(
     r"还(?:差|缺)|需要.{0,8}(?:哪些|什么)材料|what.{0,24}(?:else|missing)|"
     r"what (?:documents|materials) (?:do|should|are)|when can i submit", re.I,
-)
-_MATERIAL_CORRECTION = re.compile(
-    r"更正|修改|改成|不对|有误|不一致|弄错|换成|应为|需要改|不正确|实际.{0,12}(?:是|为)|"
-    r"\b(?:correction|corrected|wrong|inaccurate|mistake|change[sd]?|instead)\b",
-    re.I,
 )
 _ATTACHMENT_TYPE_QUESTION = re.compile(
     r"^(?:请问)?(?:这(?:个|份|张)|我(?:刚)?上传的|附件里).{0,24}(?:算什么|是什么|属于什么)"
@@ -461,14 +457,25 @@ def _process_customer_inbound(
     body = new_reply_body(body)
     language = detect_reply_language(body, subject, *(a.filename for a in attachments))
     had_question = _looks_like_question(body)
-    material_correction = bool(
-        _MATERIAL_CORRECTION.search(body)
-        and is_current_material_confirmation_reply(settings, case, sender=sender, reply_to=reply_to)
-    )
     is_customer = bool(case.customer_email and normalize_email(sender) == normalize_email(case.customer_email))
     stop_delivery = is_customer and bool(_STOP_DELIVERY.search(body))
+    requested_version = material_confirmation_reply_version(settings, case, sender=sender, reply_to=reply_to)
+    material_intent = None
+    if requested_version is not None and not stop_delivery:
+        material_intent = classify_material_confirmation_reply(settings, body) if body else "acknowledge"
+        stop_delivery = material_intent == "stop"
+    material_correction = material_intent == "change" and requested_version == case.case_version
+    material_ack = not attachments and material_intent in {"confirm", "acknowledge"}
+    reply_keys = dict(event_id=email_event_id, sender=sender, body=body, reply_to=reply_to)
+    reply_confirmed = not attachments and not stop_delivery and (
+        (material_intent == "confirm" and requested_version == case.case_version and confirm_materials_from_reply(
+            settings, case_id, event_id=email_event_id, sender=sender, reply_to=reply_to,
+        ))
+        or (requested_version is None and acknowledge_delivery_from_reply(settings, case_id, **reply_keys))
+    )
     operation_id = f"{INBOUND_REPLY_OPERATION_PREFIX}{settings.tenant_id}:{email_event_id}"
-    frozen = _saved_reply(settings, case_id, operation_id) if send_reply and not stop_delivery else None
+    skip_generic_reply = stop_delivery or reply_confirmed or material_ack
+    frozen = _saved_reply(settings, case_id, operation_id) if send_reply and not skip_generic_reply else None
     if frozen:
         reply_sent, reply_skip = _dispatch_reply(settings, frozen, email_event_id)
         conclusion = "material_change" if attachments or had_question or material_correction else "acknowledged"
@@ -482,7 +489,7 @@ def _process_customer_inbound(
     trip = None
     received_on = received_at.astimezone().date()
     visitor = case.route == RouteCode.STANDARD_VISITOR
-    if is_customer and not stop_delivery and not case.human_takeover:
+    if is_customer and requested_version is None and not (skip_generic_reply or case.human_takeover):
         current_itinerary = (
             get_case_itinerary(settings=settings, case_id=case_id)
             if visitor and settings.model_configured else None
@@ -491,6 +498,14 @@ def _process_customer_inbound(
             settings=settings, body=body, received_on=received_on,
             awaiting_travel_details=bool(current_itinerary and current_itinerary.awaiting_details),
             is_visitor=visitor,
+            itinerary_context={
+                "version": current_itinerary.version,
+                "replying_to_current": bool(current_itinerary.message_id and (
+                    current_itinerary.message_id == reply_to or current_itinerary.message_id in references
+                )),
+                "departure": current_itinerary.start.isoformat() if current_itinerary.start else None,
+                "duration": current_itinerary.days,
+            } if current_itinerary else None,
         )
         stop_delivery = bool(trip and trip.stop_delivery)
         if trip is None and body.strip() and settings.model_configured and case.status == CaseStatus.READY_TO_DELIVER:
@@ -504,14 +519,15 @@ def _process_customer_inbound(
             attached=(), missing_titles_zh=(), missing_titles_en=(), reply_sent=False,
             reply_skipped_reason="stop_delivery", conclusion="stop_delivery",
         )
-    had_question = had_question or bool(trip and trip.question)
-    reply_keys = dict(event_id=email_event_id, sender=sender, body=body, reply_to=reply_to)
-    if not attachments and (
-        acknowledge_delivery_from_reply(settings, case_id, **reply_keys,
-                                        semantic_receipt=bool(trip and trip.delivery_receipt))
-        or (not material_correction and confirm_materials_from_reply(
-            settings, case_id, **reply_keys, semantic_confirmation=bool(trip and trip.material_confirmation)))
+    had_question = had_question or material_intent == "question" or bool(trip and trip.question)
+    if reply_confirmed or material_ack or (
+        not attachments and trip and trip.delivery_receipt
+        and acknowledge_delivery_from_reply(settings, case_id, **reply_keys, semantic_receipt=True)
     ):
+        if material_ack and not reply_confirmed:
+            _finish_inbound(settings, case_id, email_event_id, "acknowledged")
+            if send_reply:
+                advance_material_confirmation(settings, case_id)
         return InboundProcessResult(
             case_id=case_id, email_event_id=email_event_id, had_question=False,
             language=language, attached=(), missing_titles_zh=(), missing_titles_en=(),
@@ -519,9 +535,8 @@ def _process_customer_inbound(
         )
     purpose = None
     if visitor:
-        if case.status not in FINISHED_CASE_STATUSES and not case.human_takeover and is_customer:
-            stated = trip.purpose if trip is not None else stated_visit_purpose(body)
-            record_visitor_purpose(settings, case_id, email_event_id, stated)
+        if trip and case.status not in FINISHED_CASE_STATUSES and not case.human_takeover and is_customer:
+            record_visitor_purpose(settings, case_id, email_event_id, trip.purpose)
         with psycopg.connect(settings.database_url) as conn:
             purpose = get_stated_visitor_purpose(conn, settings.tenant_id, case_id)
     store = LocalFileStore(settings.file_storage_dir)
@@ -646,7 +661,7 @@ def _process_customer_inbound(
     itinerary = prepare_itinerary_reply(
         settings=settings, case=case, email_event_id=email_event_id, sender=sender,
         body=body, language=language, references=references, reply_to=reply_to,
-        tourism=purpose == "tourism", trip=trip, received_on=received_on,
+        tourism=purpose == "tourism", trip=trip,
     )
     if itinerary:
         # Creating a different draft advances the case version.
@@ -672,7 +687,9 @@ def _process_customer_inbound(
         question_block = ("已收到您对材料的更正，顾问会核对后处理。"
                           if language == "zh" else
                           "I received your correction. Your advisor will check it before review continues.")
-    elif _looks_like_question(unanswered_body) or (trip and trip.question and trip.question in unanswered_body):
+    elif material_intent == "question" or _looks_like_question(unanswered_body) or (
+        trip and trip.question and trip.question in unanswered_body
+    ):
         saved_itinerary = get_case_itinerary(settings=settings, case_id=case_id) if visitor else None
         qa = answer_customer_question(
             settings=settings,

@@ -12,12 +12,6 @@ from visa_agent.ai_capabilities.document_translation import translate_ocr_pages
 from visa_agent.config import Settings
 from visa_agent.domain.errors import DomainError
 
-_TOPIC = re.compile(r"行程|\bitinerar(?:y|ies)\b|\btravel (?:plan|schedule)\b", re.I)
-_ACTION = re.compile(
-    r"帮(?:忙|我|我们)?|做|写|制作|制定|规划|生成|安排|导出|发给我|下载|看着来|你来定|"
-    r"\b(?:draft|prepare|make|create|generate|regenerate|write|organize|organise|put together|plan my|send me|download)\b",
-    re.I,
-)
 _DATE = re.compile(r"(?<!\d)(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})(?!\d)\s*(?:日|号)?")
 _MONTH = r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
 _EN_DATE = re.compile(
@@ -26,15 +20,6 @@ _EN_DATE = re.compile(
 _CHINESE_NUMBER = r"[一二两三四五六七八九十]{1,3}"
 _DURATION = re.compile(rf"(?<!\d)([0-9]{{1,3}}|{_CHINESE_NUMBER})\s*(?:天|days?\b)", re.I)
 _DIGITS = "零一二三四五六七八九"
-_EDIT = re.compile(r"修改|更改|调整|改[成到为一下]|改日期|换[成掉]|换去|取消|加[入上]|少去|多去|去掉|"
-                   r"\b(?:change|move|revise|edit|adjust|add|remove|replace|skip|instead|prefer)\b", re.I)
-_CONFIRM = re.compile(
-    r"^(?:我|我们)?\s*(?:确认(?:行程(?:单)?(?:\s*第\s*\d+\s*版)?)?|"
-    r"行程(?:单)?(?:没问题|可以|确认))\s*[。！!.]*$"
-    r"|^(?:i confirm(?: (?:the )?itinerary)?|confirmed|confirm(?: (?:the )?itinerary)?|"
-    r"(?:the itinerary )?looks good)\s*[.!]*$",
-    re.I,
-)
 _DATED_ROW = re.compile(r"^\d{4}-\d{2}-\d{2}(?: — \d{4}-\d{2}-\d{2})? {2}")
 _LEGACY_BOOKING_NOTE = re.compile(
     r"住宿.{0,32}待.{0,8}确认|航班.{0,32}待确认|"
@@ -43,22 +28,6 @@ _LEGACY_BOOKING_NOTE = re.compile(
 )
 
 
-def is_itinerary_request(text: str) -> bool:
-    declined = re.search(r"(?:不用|不必|不需要|别)(?:再|帮我)?(?:做|写|安排|修改|改|制作)|"
-                         r"\b(?:do not|don['’]t|no need to)\s+(?:make|draft|change|revise|plan)\b", text, re.I)
-    return bool(not declined and _TOPIC.search(text) and _ACTION.search(text))
-
-
-def is_itinerary_revision(text: str) -> bool:
-    return bool(_EDIT.search(text))
-
-
-def mentions_itinerary(text: str) -> bool:
-    return bool(_TOPIC.search(text))
-
-
-def confirms_itinerary(text: str) -> bool:
-    return bool(_CONFIRM.fullmatch(text.strip()))
 
 
 _RELATIVE_ZH = re.compile(rf"(下(?:个)?月|这(?:个)?月|本月)\s*(\d{{1,2}}|{_CHINESE_NUMBER})\s*(?:日|号)")
@@ -94,9 +63,6 @@ def travel_dates(text: str, *, reference_day: date | None = None) -> set[date]:
     return dates
 
 
-def mentions_travel_date(text: str) -> bool:
-    return bool(_DATE.search(text) or _EN_DATE.search(text) or _RELATIVE_ZH.search(text)
-                or _RELATIVE_EN.search(text))
 
 
 def _whole_number(raw: str) -> int:

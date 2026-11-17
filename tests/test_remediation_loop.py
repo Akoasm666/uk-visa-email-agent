@@ -14,6 +14,7 @@ from unittest.mock import patch
 import psycopg
 
 from visa_agent.ai_capabilities.language import detect_reply_language
+from visa_agent.ai_capabilities.visitor_trip import VisitorTrip
 from visa_agent.ai_capabilities.ukvi_lookup import select_ukvi_urls
 from visa_agent.case_service.inbound_agent import process_customer_inbound
 from visa_agent.case_service.itinerary import attach_existing_itinerary_pdfs, get_case_itinerary
@@ -77,6 +78,22 @@ def _fake_outbox(**_kwargs):  # noqa: ANN003
 
 
 class LanguageAndUkviTests(unittest.TestCase):
+    def test_material_reply_keeps_the_customer_message_and_signoff_for_the_model(self) -> None:
+        from visa_agent.email_adapter.threading import new_reply_body
+
+        body = "确认材料\n发自我的\u2006iPhone\n不过出发日期还要改。"
+        self.assertEqual(new_reply_body(f"{body}\n\n> 在星期二，Agent 写道：\n> 旧邮件"), body)
+
+    def test_departure_uses_model_date_or_window_without_reinterpreting_the_quote(self) -> None:
+        from visa_agent.ai_capabilities.visitor_trip import _decode_trip
+
+        quote = "我大概下个月15号出发"
+        email = f"银行流水要几个月的？{quote}，准备呆7天左右"
+        exact = _decode_trip({"departure": {"date": "2026-12-15", "quote": quote}}, email)
+        self.assertEqual(exact.departure, date(2026, 12, 15))
+        self.assertIsNone(_decode_trip({}, email).departure)
+        self.assertIsNone(_decode_trip({"departure": {"date": None, "quote": quote}}, email).departure)
+
     def test_budget_totals_and_required_amount_claims_are_checked(self) -> None:
         from visa_agent.ai_capabilities.customer_reply import _has_practical_funds_guidance, _trip_budget
 
@@ -267,7 +284,7 @@ class RemediationAcceptanceTests(unittest.TestCase):
                 if "下个月中旬动身" in payload["email"]:
                     report.update(
                         purpose={"value": "tourism", "quote": "我想去英国玩一趟"},
-                        departure={"date": fifteenth, "quote": "下个月中旬动身"},
+                        departure={"date": None, "quote": "下个月中旬动身"},
                         duration={"days": 7, "approximate": True, "quote": "待上一周左右"},
                     )
                 elif "下个月十五号" in payload["email"]:
@@ -411,24 +428,6 @@ class RemediationAcceptanceTests(unittest.TestCase):
 
             resume_material_confirmations(settings)
             self.assertEqual(requests(), [])
-            with patch("visa_agent.fastapi_app.get_settings", return_value=settings):
-                reviewed = TestClient(app).post(
-                    f"/workbench/cases/{case.id}/requirements/intention_to_leave/review",
-                    data={"expected_case_version": get_case(**keys).case_version},
-                )
-                self.assertIn("材料核对已保存", reviewed.text)
-            plan = get_case_itinerary(settings=settings, case_id=case.id)
-            self.assertTrue(plan.advisor_reviewed)
-            self.assertFalse(plan.confirmed)
-            from visa_agent.delivery import assemble_package
-            from visa_agent.domain.enums import DeliveryKind
-
-            package = assemble_package(
-                **keys, package_kind=DeliveryKind.FINAL_PACKAGE.value, file_store=store,
-                evidence_ids=[itinerary.id], expected_case_version=get_case(**keys).case_version,
-            )
-            self.assertEqual(package.items[0].evidence_id, itinerary.id)
-
             case_version = get_case(**keys).case_version
             legacy_message_id = f"<legacy-{case.id}@example.com>"
             with psycopg.connect(DB) as conn:
@@ -442,7 +441,25 @@ class RemediationAcceptanceTests(unittest.TestCase):
                      f"{MATERIAL_CONFIRMATION_OPERATION_PREFIX}{TENANT}:{case.id}:{case_version}",
                      json.dumps([address]), legacy_message_id),
                 )
-            resume_material_confirmations(settings)
+            with patch("visa_agent.fastapi_app.get_settings", return_value=settings):
+                reviewed = TestClient(app).post(
+                    f"/workbench/cases/{case.id}/requirements/intention_to_leave/review",
+                    data={"expected_case_version": get_case(**keys).case_version},
+                )
+                self.assertIn("材料核对已保存", reviewed.text)
+                self.assertIn("等客户确认材料", reviewed.text)
+            plan = get_case_itinerary(settings=settings, case_id=case.id)
+            self.assertTrue(plan.advisor_reviewed)
+            self.assertFalse(plan.confirmed)
+            from visa_agent.delivery import assemble_package
+            from visa_agent.domain.enums import DeliveryKind
+
+            package = assemble_package(
+                **keys, package_kind=DeliveryKind.FINAL_PACKAGE.value, file_store=store,
+                evidence_ids=[itinerary.id], expected_case_version=get_case(**keys).case_version,
+            )
+            self.assertEqual(package.items[0].evidence_id, itinerary.id)
+
             [(old_message, summary)] = requests()
             self.assertEqual(old_message, legacy_message_id)
             self.assertIn("确认材料", summary)
@@ -466,11 +483,15 @@ class RemediationAcceptanceTests(unittest.TestCase):
             send_count = server.send_message.call_count
             resume_material_confirmations(settings)
             self.assertEqual(server.send_message.call_count, send_count)
-            receive("收到，谢谢。", old_message)
+            with patch("visa_agent.case_service.inbound_agent.classify_material_confirmation_reply",
+                       return_value="acknowledge"):
+                receive("收到，谢谢。", old_message)
             self.assertEqual(get_case(**keys).status, CaseStatus.CUSTOMER_CONFIRMATION)
 
             add_file("bank", "updated-bank.pdf")
-            receive("确认本版材料", old_message)
+            with patch("visa_agent.case_service.inbound_agent.classify_material_confirmation_reply",
+                       return_value="confirm"):
+                receive("确认本版材料", old_message)
             self.assertEqual(get_case(**keys).status, CaseStatus.CUSTOMER_CONFIRMATION)
             self.assertFalse(get_review_board(**keys).customer_confirmation_effective)
             [_, (current_message, new_summary)] = requests()
@@ -480,7 +501,16 @@ class RemediationAcceptanceTests(unittest.TestCase):
                 part.get_filename() for part in server.send_message.call_args.args[0].iter_attachments()
             })
 
-            receive(f"确认材料。\n\nOn Tuesday, Agent wrote:\n> {new_summary}", current_message)
+            body = "几个附件我全看过了，可以继续。\n\n由任意客户端发送"
+            with (
+                patch("visa_agent.case_service.inbound_agent.extract_visitor_trip") as extract,
+                patch("visa_agent.case_service.inbound_agent.classify_material_confirmation_reply",
+                      return_value="confirm") as classify,
+            ):
+                receive(f"{body}\n\n> 在星期二，Agent 写道：\n> {new_summary}", current_message)
+                extract.assert_not_called()
+                classify.assert_called_once_with(settings, body)
+            self.assertEqual(list_open_questions(**keys), [])
             self.assertEqual(get_case(**keys).status, CaseStatus.FINAL_REVIEW)
             board = get_review_board(**keys)
             self.assertTrue(board.customer_confirmation_effective)
@@ -529,7 +559,10 @@ class RemediationAcceptanceTests(unittest.TestCase):
         with patch("visa_agent.case_service.inbound_agent.enqueue_and_maybe_send",
                    side_effect=_fake_outbox) as send, patch(
             "visa_agent.case_service.inbound_agent.answer_customer_question",
-        ) as generic:
+        ) as generic, patch("visa_agent.case_service.inbound_agent.extract_visitor_trip", side_effect=[
+            VisitorTrip(days=7, duration_quote="7天", itinerary_action="request", itinerary_quote="能帮我做个行程吗？"),
+            VisitorTrip(departure=date(2027, 1, 29), departure_quote="从2027年1月29日开始"),
+        ]):
             for seq, body in enumerate(("我去英国7天，能帮我做个行程吗？", "从2027年1月29日开始。")):
                 received = persist_inbound(**case_args, file_store=store, mail=InboundEmail(
                     from_addr=email_addr, to_addrs=("agent@example.com",),
@@ -563,17 +596,31 @@ class RemediationAcceptanceTests(unittest.TestCase):
         ensure_seed_route_packs(database_url=DB)
         case = create_case(**args, customer_email=address, route=RouteCode.STANDARD_VISITOR)
         departure = date.today() + timedelta(days=40)
-        body = f"访问目的是旅游。我从上海出发去爱丁堡，计划从{departure}起停留 5 天。"
-        event = persist_inbound(**args, file_store=LocalFileStore(settings.file_storage_dir), mail=InboundEmail(
-            from_addr=address, to_addrs=("agent@example.com",), subject="英国旅行",
-            body_text=body + "\n\nOn Monday, Agent wrote:\n> 目的是商务。",
-            provider_message_id=f"tourism-{case.id}",
-        ))
-        attribute_inbound_to_case(**args, case_id=case.id, email_event_id=event.email_event_id)
-        with patch("visa_agent.email_adapter.outbox.send_smtp", return_value="accepted") as smtp:
+        def receive(body, name):
+            event = persist_inbound(**args, file_store=LocalFileStore(settings.file_storage_dir), mail=InboundEmail(
+                from_addr=address, to_addrs=("agent@example.com",), subject="英国旅行",
+                body_text=body + "\n\nOn Monday, Agent wrote:\n> 目的是商务。",
+                provider_message_id=f"tourism-{case.id}-{name}",
+            ))
+            attribute_inbound_to_case(**args, case_id=case.id, email_event_id=event.email_event_id)
+            return event.email_event_id
+
+        with patch("visa_agent.email_adapter.outbox.send_smtp", return_value="accepted") as smtp, patch(
+            "visa_agent.case_service.inbound_agent.extract_visitor_trip",
+            side_effect=[VisitorTrip(departure=departure, days=5, cities=("Edinburgh",)), VisitorTrip(purpose="tourism")],
+        ):
+            first = receive(f"我从上海出发去爱丁堡，计划从{departure}起停留 5 天。", "dates")
+            process_customer_inbound(settings=settings, case_id=case.id, email_event_id=first)
+            recorded = get_case_itinerary(settings=settings, case_id=case.id)
+            self.assertEqual((recorded.start, recorded.days, recorded.status), (departure, 5, "details_recorded"))
+            self.assertIsNone(recorded.evidence_id)
+            if smtp.call_args:
+                self.assertNotIn("提供行程开始日期", smtp.call_args.kwargs["body_text"])
+            sends_before_purpose = smtp.call_count
+            purpose = receive("访问目的是旅游。", "purpose")
             for _ in range(2):
-                process_customer_inbound(settings=settings, case_id=case.id, email_event_id=event.email_event_id)
-            self.assertEqual(smtp.call_count, 1)
+                process_customer_inbound(settings=settings, case_id=case.id, email_event_id=purpose)
+            self.assertEqual(smtp.call_count, sends_before_purpose + 1)
             self.assertNotIn("访问目的说明", smtp.call_args.kwargs["body_text"])
             self.assertTrue(smtp.call_args.kwargs["attachments"][0][1].startswith(b"%PDF-"))
         plan = get_case_itinerary(settings=settings, case_id=case.id)
@@ -759,7 +806,22 @@ class RemediationAcceptanceTests(unittest.TestCase):
             activities[1] = "Visit Windsor Castle"
             return {"choices": [{"message": {"content": json.dumps({"activities": activities})}}]}
 
-        with patch("visa_agent.case_service.inbound_agent.extract_visitor_trip", return_value=None), patch(
+        def interpret(*, body, **_):
+            interpretations = {
+                "访问目的是旅游。我想玩7天，请帮我做一份行程。": VisitorTrip(
+                    purpose="tourism", days=7, itinerary_action="request", itinerary_quote="请帮我做一份行程。"),
+                "预计下个月15号出发": VisitorTrip(departure=date(2026, 12, 15)),
+                "可以 没问题": VisitorTrip(
+                    departure=date(2026, 11, 17), itinerary_action="confirm", itinerary_quote="可以 没问题"),
+                "把行程改到2026年12月18日。": VisitorTrip(
+                    departure=date(2026, 12, 18), itinerary_action="revise", itinerary_quote="把行程改到2026年12月18日。"),
+                "确认行程": VisitorTrip(itinerary_action="confirm", itinerary_quote="确认行程"),
+                "请把第二天改成参观温莎城堡。": VisitorTrip(
+                    itinerary_action="revise", itinerary_quote="请把第二天改成参观温莎城堡。"),
+            }
+            return interpretations.get(body.splitlines()[0], VisitorTrip())
+
+        with patch("visa_agent.case_service.inbound_agent.extract_visitor_trip", side_effect=interpret) as extractor, patch(
             "visa_agent.email_adapter.outbox.send_smtp", return_value="mock accepted"
         ) as smtp, patch(
             "visa_agent.ai_capabilities.visitor_itinerary.SiliconFlowClient"
@@ -797,6 +859,12 @@ class RemediationAcceptanceTests(unittest.TestCase):
                 )
                 self.assertIn("材料核对已保存", reviewed.text)
             self.assertTrue(get_case_itinerary(settings=settings, case_id=case.id).advisor_reviewed)
+            confirmed_first = reply("可以 没问题\n发自我的 iPhone", first.message_id)
+            self.assertTrue(extractor.call_args.kwargs["itinerary_context"]["replying_to_current"])
+            self.assertEqual((confirmed_first.version, confirmed_first.status), (1, "confirmed"))
+            self.assertEqual(confirmed_first.start, first.start)
+            self.assertEqual(confirmed_first.evidence_id, first.evidence_id)
+            self.assertFalse(smtp.call_args.kwargs.get("attachments"))
             second = reply("把行程改到2026年12月18日。", first.message_id)
             self.assertEqual((second.version, second.status), (2, "awaiting_confirmation"))
             self.assertFalse(second.advisor_reviewed)

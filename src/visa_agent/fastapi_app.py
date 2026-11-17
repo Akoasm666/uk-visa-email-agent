@@ -50,7 +50,7 @@ from visa_agent.case_service.closure import (
 )
 from visa_agent.case_service.inbound_agent import process_customer_inbound, process_persisted_inbound
 from visa_agent.case_service.itinerary import get_case_itinerary
-from visa_agent.case_service.material_confirmation import material_confirmation_sent
+from visa_agent.case_service.material_confirmation import material_confirmation_sent, try_advance_material_confirmation
 from visa_agent.case_service.remediation import (
     acknowledge_advisor_question,
     count_pending_advisor_inbox,
@@ -1936,6 +1936,7 @@ async def workbench_requirement_applicability(
             expected_case_version=_parse_expected_version(form.get("expected_case_version")),
         )
         msg = "材料判断已保存"
+        await run_in_threadpool(try_advance_material_confirmation, settings, case_id)
     except DomainError as exc:
         detail = "案件有更新，请根据当前清单重新判断" if exc.code == ErrorCode.CONFLICT_VERSION else exc.message
         msg = f"保存失败：{detail}"
@@ -1959,6 +1960,7 @@ async def workbench_review_requirement(
             expected_case_version=_parse_expected_version(form.get("expected_case_version")),
         )
         msg = "材料核对已保存"
+        await run_in_threadpool(try_advance_material_confirmation, settings, case_id)
     except DomainError as exc:
         detail = "材料有更新，请刷新后重新核对" if exc.code == ErrorCode.CONFLICT_VERSION else exc.message
         msg = f"保存失败：{detail}"
